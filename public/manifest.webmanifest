@@ -1,0 +1,9 @@
+{
+  "name": "PCP Moraes",
+  "short_name": "PCP",
+  "start_url": "/posto",
+  "display": "standalone",
+  "background_color": "#112324",
+  "theme_color": "#112324",
+  "icons": [{ "src": "/icone.svg", "sizes": "any", "type": "image/svg+xml" }]
+}

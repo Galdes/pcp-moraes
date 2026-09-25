@@ -1,0 +1,49 @@
+# Sobe banco + sistema. Uso: cp .env.example .env (ajuste os segredos) && docker compose up -d
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pcp
+      POSTGRES_PASSWORD: ${DB_SENHA:-pcp}
+      POSTGRES_DB: pcp
+      TZ: America/Sao_Paulo
+    volumes:
+      - dados:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pcp"]
+      interval: 5s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://pcp:${DB_SENHA:-pcp}@db:5432/pcp
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+    ports:
+      - "3000:3000"
+
+  # agendador: sincroniza o Omie a cada 5 min e recalcula a programação a cada 30 min
+  cron:
+    image: curlimages/curl:8.10.1
+    restart: unless-stopped
+    depends_on: [app]
+    env_file: .env
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        i=0
+        while true; do
+          curl -s -X POST -H "Authorization: Bearer $$CRON_SECRET" http://app:3000/api/cron/omie > /dev/null
+          if [ $$((i % 6)) -eq 0 ]; then curl -s -X POST -H "Authorization: Bearer $$CRON_SECRET" http://app:3000/api/cron/programacao > /dev/null; fi
+          i=$$((i + 1)); sleep 300
+        done
+
+volumes:
+  dados:

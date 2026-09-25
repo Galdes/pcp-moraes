@@ -1,0 +1,47 @@
+@import "tailwindcss";
+
+@theme {
+  --color-tinta: #0e1b1c;
+  --color-petroleo: #112324;
+  --color-petroleo-2: #16292b;
+  --color-latao: #cba86a;
+  --color-latao-escuro: #8a6a33;
+  --color-carta: #f4f1ea;
+  --color-linha: #e2ddd1;
+  --color-apagado: #5d6b6b;
+  --color-ok: #1f7a4d;
+  --color-atencao: #b7791f;
+  --color-alerta: #c0392b;
+  --color-processo: #1d5f8a;
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+html, body { background: var(--color-carta); color: var(--color-tinta); }
+body { font-family: var(--font-sans); -webkit-font-smoothing: antialiased; }
+
+@utility card { @apply rounded-lg border border-linha bg-white; }
+@utility card-h { @apply flex items-center justify-between gap-3 border-b border-linha px-4 py-3; }
+@utility card-t { @apply text-sm font-semibold tracking-tight; }
+@utility btn { @apply inline-flex items-center justify-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-50; }
+@utility btn-pri { @apply btn border-petroleo bg-petroleo text-white hover:bg-petroleo-2; }
+@utility btn-sec { @apply btn border-linha bg-white text-tinta hover:bg-carta; }
+@utility btn-perigo { @apply btn border-alerta/30 bg-white text-alerta hover:bg-alerta/5; }
+@utility btn-xs { @apply px-2 py-0.5 text-xs; }
+@utility inp { @apply w-full rounded-md border border-linha bg-white px-2.5 py-1.5 text-sm outline-none focus:border-petroleo focus:ring-2 focus:ring-petroleo/15; }
+@utility lbl { @apply mb-1 block text-xs font-medium text-apagado; }
+@utility tbl {
+  @apply w-full text-sm;
+  & th { @apply border-b border-linha bg-carta/60 px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide whitespace-nowrap text-apagado; }
+  & td { @apply border-b border-linha/70 px-3 py-2 align-top; }
+  & tr:last-child td { @apply border-b-0; }
+}
+@utility num { @apply text-right tabular-nums; }
+@utility badge { @apply inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-semibold uppercase tracking-wide whitespace-nowrap; }
+@utility coord { @apply font-mono text-[11px] uppercase tracking-[0.12em] text-apagado; }
+
+@media print {
+  .no-print { display: none !important; }
+  body { background: white; }
+  .card { border-color: #999; }
+}
