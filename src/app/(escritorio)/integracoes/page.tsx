@@ -2,10 +2,11 @@ import { sql } from "@/lib/db";
 import { Aviso, Cabecalho, Card, Vazio } from "@/components/ui";
 import { exigir, ESCRITORIO } from "@/server/auth";
 import { CONTRATOS, contratoLiberado, type NomeContrato } from "@/integrations/omie/contratos";
-import { modoOmie, montarChamada } from "@/integrations/omie/sync";
+import { montarChamada } from "@/integrations/omie/sync";
+import { lerConfigOmie } from "@/integrations/omie/config";
 import { resumoParaMonday } from "@/integrations/monday/resumo";
 import { fmtDataHora } from "@/lib/formato";
-import { outboxAction, sincronizarAction } from "./actions";
+import { ativarOmieAction, conectarOmieAction, desativarOmieAction, desconectarOmieAction, modoOmieAction, outboxAction, sincronizarAction, testarOmieAction, validadosOmieAction } from "./actions";
 
 export const dynamic = "force-dynamic";
 export const metadata = { title: "Integrações" };
@@ -20,10 +21,12 @@ const ENTIDADES: [string, string, string][] = [
 ];
 
 export default async function Integracoes({ searchParams }: { searchParams: Promise<Record<string, string>> }) {
-  await exigir(...ESCRITORIO);
+  const usuario = await exigir(...ESCRITORIO);
+  const admin = usuario.perfil === "admin";
   const sp = await searchParams;
-  const modo = modoOmie();
-  const credenciais = !!(process.env.OMIE_APP_KEY && process.env.OMIE_APP_SECRET);
+  const cfg = await lerConfigOmie();
+  const modo = cfg.modo;
+  const credenciais = !!cfg.appKey;
   const estados = new Map((await sql`select * from integracao_estado`).map((e) => [e.entidade as string, e]));
   const api = estados.get("omie:api");
   const outbox = await sql`select * from outbox order by case status when 'erro' then 0 when 'pendente' then 1 else 2 end, id desc limit 40`;
@@ -38,6 +41,74 @@ export default async function Integracoes({ searchParams }: { searchParams: Prom
       <Cabecalho coord="Sistema" titulo="Integrações" sub="Omie é o dono de produtos, estruturas, estoque, pedidos e compras. O PCP lê de lá e devolve OPs e requisições de compra." />
       <Aviso busca={sp} />
 
+      <Card titulo="Conexão com o Omie" className="mb-4" acoes={
+        admin && credenciais && (
+          <div className="flex gap-2">
+            <form action={testarOmieAction}><button className="btn-sec btn-xs">Testar conexão</button></form>
+            {cfg.origemModo !== "ambiente" && (modo === "ativo"
+              ? <form action={desativarOmieAction}><button className="btn-perigo btn-xs">Desativar</button></form>
+              : <form action={ativarOmieAction}><button className="btn-pri btn-xs">Ativar</button></form>)}
+          </div>
+        )
+      }>
+        {cfg.aviso && <p className="mb-3 rounded bg-atencao/10 px-3 py-2 text-sm text-atencao">{cfg.aviso}</p>}
+        <div className="grid gap-6 lg:grid-cols-2">
+          <div>
+            <div className="coord mb-1">1 · Credenciais</div>
+            {cfg.origemCredenciais === "ambiente" ? (
+              <p className="text-sm">Definidas nas variáveis do servidor (App Key <b className="font-mono">••••{cfg.finalChave}</b>). Essas têm prioridade sobre a tela.</p>
+            ) : credenciais ? (
+              <div className="text-sm">
+                <p>Conectado com a App Key <b className="font-mono">••••{cfg.finalChave}</b>{cfg.credenciaisSalvasEm && <> · salva em {fmtDataHora(cfg.credenciaisSalvasEm)}</>}.</p>
+                {admin && (
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <details className="w-full">
+                      <summary className="cursor-pointer text-xs text-apagado">trocar credenciais</summary>
+                      <FormCredenciais />
+                    </details>
+                    <form action={desconectarOmieAction}><button className="btn-perigo btn-xs">Desconectar</button></form>
+                  </div>
+                )}
+              </div>
+            ) : admin ? (
+              cfg.podeSalvar ? (
+                <>
+                  <p className="text-sm text-apagado">No Omie: menu do usuário → <b>Portal do Desenvolvedor</b> (developer.omie.com.br) → <b>Minhas aplicações</b> → copie a App Key e o App Secret da Moraes. O PCP testa no Omie antes de salvar e de ativar; as chaves ficam criptografadas e não aparecem de novo na tela.</p>
+                  <FormCredenciais />
+                </>
+              ) : (
+                <p className="text-sm text-alerta">O servidor não tem um segredo para criptografar as credenciais. Defina CHAVE_CONFIG (16+ caracteres) nas variáveis do servidor.</p>
+              )
+            ) : (
+              <p className="text-sm text-apagado">Não configuradas. Peça a um administrador para conectar o Omie.</p>
+            )}
+          </div>
+          <div>
+            <div className="coord mb-1">2 · Modo</div>
+            {cfg.origemModo === "ambiente" ? (
+              <p className="text-sm">Fixado em <b>{modo}</b> pela variável OMIE_MODO do servidor.</p>
+            ) : admin ? (
+              <form action={modoOmieAction} className="space-y-1 text-sm">
+                {([
+                  ["desligado", "Desligado", "nada é lido nem enviado"],
+                  ["simulacao", "Simulação", "OPs e requisições ficam na fila e você vê o JSON que seria enviado; nada vai ao Omie"],
+                  ["ativo", "Ativo", "lê produtos, estruturas, estoque e pedidos e envia OPs/requisições liberadas"],
+                ] as const).map(([v, r, d]) => (
+                  <label key={v} className="flex items-start gap-2">
+                    <input type="radio" name="modo" value={v} defaultChecked={modo === v} disabled={v === "ativo" && !credenciais} className="mt-1" />
+                    <span><b>{r}</b> <span className="text-xs text-apagado">· {d}</span></span>
+                  </label>
+                ))}
+                <button className="btn-pri btn-xs mt-2">Aplicar modo</button>
+              </form>
+            ) : (
+              <p className="text-sm">Atual: <b>{modo}</b>.</p>
+            )}
+            <p className="mt-3 text-xs text-apagado">3 · Libere os métodos de escrita marcados “validar” no quadro “Métodos da API usados” só depois de testá-los no portal do Omie.</p>
+          </div>
+        </div>
+      </Card>
+
       <div className="grid gap-4 xl:grid-cols-[1fr_380px]">
         <Card titulo={<>Omie <span className={`badge ml-2 ${corModo}`}>{modo}</span></>} corpo="p-0" acoes={
           modo === "ativo" && <form action={sincronizarAction}><button className="btn-pri btn-xs">Sincronizar tudo agora</button></form>
@@ -49,7 +120,7 @@ export default async function Integracoes({ searchParams }: { searchParams: Prom
           </div>
           {modo !== "ativo" && (
             <p className="border-b border-linha bg-atencao/5 px-4 py-2 text-xs">
-              {modo === "simulacao" ? "Modo simulação: nada é chamado no Omie. Os envios ficam na fila e você pode conferir abaixo exatamente o que seria enviado." : "Integração desligada."} Para ativar: configure OMIE_APP_KEY, OMIE_APP_SECRET e OMIE_MODO=ativo no servidor.
+              {modo === "simulacao" ? "Modo simulação: nada é chamado no Omie. Os envios ficam na fila e você pode conferir abaixo exatamente o que seria enviado." : "Integração desligada."} Para ativar, use o quadro “Conexão com o Omie” acima.
             </p>
           )}
           <table className="tbl">
@@ -77,7 +148,7 @@ export default async function Integracoes({ searchParams }: { searchParams: Prom
             <tbody>
               {(Object.keys(CONTRATOS) as NomeContrato[]).map((k) => {
                 const c = CONTRATOS[k];
-                const lib = contratoLiberado(k);
+                const lib = contratoLiberado(k, cfg.validados);
                 return (
                   <tr key={k}>
                     <td><div className="font-mono text-xs">{c.call}</div><div className="text-[11px] text-apagado">{c.endpoint}</div></td>
@@ -88,7 +159,19 @@ export default async function Integracoes({ searchParams }: { searchParams: Prom
               })}
             </tbody>
           </table>
-          <p className="border-t border-linha px-4 py-2 text-xs text-apagado">Métodos de escrita marcados “validar” só são chamados depois de testados no portal do Omie e listados em OMIE_CONTRATOS_VALIDADOS.</p>
+          <p className="border-t border-linha px-4 py-2 text-xs text-apagado">Métodos de escrita marcados “validar” só são chamados depois de testados no portal do Omie e liberados abaixo.</p>
+          {admin && cfg.origemValidados !== "ambiente" && (
+            <form action={validadosOmieAction} className="border-t border-linha px-4 py-3 text-xs">
+              <div className="coord mb-1">Liberar métodos de escrita testados</div>
+              {(Object.keys(CONTRATOS) as NomeContrato[]).filter((k) => CONTRATOS[k].escrita && !CONTRATOS[k].verificado).map((k) => (
+                <label key={k} className="flex items-center gap-2 py-0.5">
+                  <input type="checkbox" name="validado" value={CONTRATOS[k].call} defaultChecked={contratoLiberado(k, cfg.validados)} />
+                  <span className="font-mono">{CONTRATOS[k].call}</span>
+                </label>
+              ))}
+              <button className="btn-sec btn-xs mt-2">Salvar liberações</button>
+            </form>
+          )}
         </Card>
       </div>
 
@@ -153,5 +236,21 @@ export default async function Integracoes({ searchParams }: { searchParams: Prom
         </Card>
       </div>
     </>
+  );
+}
+
+function FormCredenciais() {
+  return (
+    <form action={conectarOmieAction} className="mt-2 grid gap-2 text-sm" autoComplete="off">
+      <label className="grid gap-0.5">
+        <span className="text-xs text-apagado">App Key</span>
+        <input name="app_key" inputMode="numeric" autoComplete="off" spellCheck={false} required className="inp font-mono" placeholder="ex.: 1234567890123" />
+      </label>
+      <label className="grid gap-0.5">
+        <span className="text-xs text-apagado">App Secret</span>
+        <input name="app_secret" type="password" autoComplete="new-password" spellCheck={false} required className="inp font-mono" />
+      </label>
+      <div><button className="btn-pri btn-xs">Testar conexão</button> <span className="text-xs text-apagado">salva só se o Omie aceitar; depois clique em “Ativar”</span></div>
+    </form>
   );
 }
