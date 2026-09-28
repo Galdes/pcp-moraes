@@ -10,6 +10,7 @@ import { sql, type Sql } from "@/lib/db";
 import { hojeNoFuso } from "@/domain/datas";
 import { ClienteOmie, ErroOmie, type ArmazemEstado, type EstadoIntegracao } from "./cliente";
 import { CONTRATOS, contratoLiberado, type NomeContrato } from "./contratos";
+import { lerConfigOmie, type ModoOmie } from "./config";
 import {
   extrairListaPedidos,
   extrairListaProdutos,
@@ -25,8 +26,9 @@ import {
   payloadRequisicaoCompra,
 } from "./mapeamento";
 
-export type ModoOmie = "desligado" | "simulacao" | "ativo";
-export const modoOmie = (): ModoOmie => (process.env.OMIE_MODO as ModoOmie) || "desligado";
+export type { ModoOmie };
+/** Modo atual: variável OMIE_MODO (se definida) ou o escolhido na tela Integrações. */
+export const modoOmie = async (): Promise<ModoOmie> => (await lerConfigOmie()).modo;
 
 export const armazemSql = (chave = "omie:api"): ArmazemEstado => ({
   async ler() {
@@ -45,13 +47,18 @@ export const armazemSql = (chave = "omie:api"): ArmazemEstado => ({
   },
 });
 
-export function criarClienteOmie(fetchFn?: typeof fetch): ClienteOmie {
+export async function criarClienteOmie(fetchFn?: typeof fetch): Promise<ClienteOmie> {
+  const cfg = await lerConfigOmie();
+  return criarClienteCom(cfg.appKey, cfg.appSecret, fetchFn);
+}
+
+export function criarClienteCom(appKey: string, appSecret: string, fetchFn?: typeof fetch, chaveEstado = "omie:api"): ClienteOmie {
   return new ClienteOmie({
-    appKey: process.env.OMIE_APP_KEY ?? "",
-    appSecret: process.env.OMIE_APP_SECRET ?? "",
+    appKey,
+    appSecret,
     reqPorMinuto: Number(process.env.OMIE_REQ_POR_MINUTO || 200),
     limiteDiario: Number(process.env.OMIE_LIMITE_DIARIO || 0),
-    estado: armazemSql(),
+    estado: armazemSql(chaveEstado),
     fetchFn,
   });
 }
@@ -250,6 +257,7 @@ export async function montarChamada(o: ItemOutbox): Promise<{ contrato: NomeCont
 }
 
 export async function processarOutbox(c: ClienteOmie, limite = 20) {
+  const { validados } = await lerConfigOmie();
   const itens = await sql<ItemOutbox[]>`
     select id, tipo, referencia, payload, tentativas from outbox
     where sistema = 'omie' and status = 'pendente' and proxima_tentativa <= now()
@@ -268,8 +276,8 @@ export async function processarOutbox(c: ClienteOmie, limite = 20) {
       falhas++;
       continue;
     }
-    if (!contratoLiberado(ch.contrato)) {
-      await sql`update outbox set ultimo_erro = ${`Aguardando validação do método ${CONTRATOS[ch.contrato].call} (OMIE_CONTRATOS_VALIDADOS)`},
+    if (!contratoLiberado(ch.contrato, validados)) {
+      await sql`update outbox set ultimo_erro = ${`Aguardando validação do método ${CONTRATOS[ch.contrato].call} (marque como validado na tela Integrações)`},
                 updated_at = now() where id = ${o.id}`;
       continue;
     }
@@ -323,7 +331,7 @@ const TAREFAS: Record<string, (c: ClienteOmie) => Promise<string>> = {
 };
 
 export async function executarSincronizacao(opcoes: { forcar?: string[]; cliente?: ClienteOmie } = {}) {
-  const modo = modoOmie();
+  const modo = await modoOmie();
   if (modo !== "ativo") return [{ entidade: "omie", ok: false, mensagem: `Integração em modo "${modo}": nada foi chamado` }];
   // uma sincronização por vez (cron, botão manual e execuções longas não se sobrepõem):
   // a trava é de sessão, então usa uma conexão reservada do pool
@@ -342,7 +350,7 @@ export async function executarSincronizacao(opcoes: { forcar?: string[]; cliente
 }
 
 async function sincronizarSemTrava(opcoes: { forcar?: string[]; cliente?: ClienteOmie }) {
-  const c = opcoes.cliente ?? criarClienteOmie();
+  const c = opcoes.cliente ?? (await criarClienteOmie());
   const estados = new Map(
     (await sql`select entidade, ultimo_sucesso from integracao_estado where entidade like 'omie:%'`).map((r) => [r.entidade as string, r.ultimo_sucesso as Date | null]),
   );
@@ -365,4 +373,27 @@ async function sincronizarSemTrava(opcoes: { forcar?: string[]; cliente?: Client
     }
   }
   return resultado;
+}
+
+// ---------- teste de conexão ----------
+/**
+ * Faz uma única leitura leve (1 produto) com as credenciais informadas.
+ * Usa um disjuntor separado ("omie:teste") para que credenciais erradas
+ * digitadas na tela não pausem a sincronização normal.
+ */
+export async function testarConexao(appKey: string, appSecret: string, fetchFn?: typeof fetch): Promise<{ ok: boolean; mensagem: string }> {
+  try {
+    const c = criarClienteCom(appKey, appSecret, fetchFn, "omie:teste");
+    const r = await c.chamar<Record<string, unknown>>(
+      CONTRATOS.listarProdutos,
+      { pagina: 1, registros_por_pagina: 1, apenas_importado_api: "N", filtrar_apenas_omiepdv: "N" },
+      { listagem: true },
+    );
+    const total = Number(r.total_de_registros ?? 0);
+    await sql`update integracao_estado set bloqueado_ate = null, erros_consecutivos = 0 where entidade = 'omie:teste'`;
+    return { ok: true, mensagem: `Conexão OK: o Omie respondeu (${total} produtos cadastrados)` };
+  } catch (e) {
+    await sql`update integracao_estado set bloqueado_ate = null where entidade = 'omie:teste'`;
+    return { ok: false, mensagem: `O Omie recusou a conexão: ${(e as Error).message}` };
+  }
 }

@@ -61,12 +61,13 @@ export class ClienteOmie {
       limiteDiario: 0,
       concorrencia: 2,
       urlBase: "https://app.omie.com.br/api/v1/",
-      fetchFn: fetch,
       agora: () => Date.now(),
       dormir: (ms: number) => new Promise((r) => setTimeout(r, ms)),
       errosParaAbrir: 3,
       pausaMin: 10,
       ...opcoes,
+      // opções passadas como undefined não podem apagar os padrões (ex.: fetchFn)
+      fetchFn: opcoes.fetchFn ?? ((...a: Parameters<typeof fetch>) => fetch(...a)),
     } as never;
   }
 
