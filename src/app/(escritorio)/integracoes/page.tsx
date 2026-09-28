@@ -129,7 +129,7 @@ export default async function Integracoes({ searchParams }: { searchParams: Prom
       </Card>
 
       <div className="mt-4 grid gap-4 xl:grid-cols-2">
-        <Card titulo="Monday (visão executiva via N8N)">
+        <Card titulo="Exportação executiva (via N8N)">
           <p className="text-sm">O N8N lê <code className="rounded bg-carta px-1">GET /api/export/monday</code> com o cabeçalho <code className="rounded bg-carta px-1">Authorization: Bearer EXPORT_TOKEN</code> e atualiza um item por máquina no quadro do Monday.</p>
           <p className="mt-2 text-sm">Token {process.env.EXPORT_TOKEN && process.env.EXPORT_TOKEN.length >= 16 ? "configurado" : <span className="text-alerta">não configurado (mín. 16 caracteres)</span>}. Máquinas no resumo agora: {monday.maquinas.length}.</p>
           <details className="mt-2">

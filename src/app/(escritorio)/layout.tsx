@@ -9,7 +9,7 @@ export default async function LayoutEscritorio({ children }: { children: React.R
     ["Acompanhar", [["/", "Painel"], ["/kanban", "Kanban dos setores"], ["/tv", "Modo TV"]]],
     ["Planejar", [["/pedidos", "Pedidos de venda"], ["/ops", "Ordens de produção"], ["/programacao", "Programação"], ["/mrp", "MRP e compras"]]],
     ["Engenharia", [["/cadastros/itens", "Itens e estruturas"], ["/cadastros/setores", "Setores e capacidade"], ["/cadastros/motivos", "Motivos de parada"], ["/qualidade", "Qualidade dos dados"]]],
-    ["Sistema", [["/integracoes", "Integrações Omie · Monday"], ["/cadastros/usuarios", "Usuários"]]],
+    ["Sistema", [["/integracoes", "Integrações Omie"], ["/cadastros/usuarios", "Usuários"]]],
   ];
   return (
     <div className="min-h-screen lg:flex">
