@@ -5,28 +5,50 @@ import { carregarCalendario, carregarSetores } from "./engenharia";
 
 const INICIO_TURNO = Number(process.env.INICIO_TURNO_HORA ?? 7);
 
-/** KPIs do topo do painel (janela padrão: últimos 30 dias). */
-export async function kpis(dias = 30) {
+/** Intervalo de datas [de, ate] (YYYY-MM-DD, inclusivo). */
+export interface Periodo {
+  de: string;
+  ate: string;
+}
+
+/** Aceita "últimos N dias" (compatível com as chamadas antigas) ou um intervalo explícito. */
+function normalizar(p: number | Periodo): Periodo {
+  if (typeof p === "number") {
+    const hoje = hojeNoFuso();
+    return { de: somarDias(hoje, -p), ate: hoje };
+  }
+  return p;
+}
+
+/**
+ * KPIs do topo do painel. Entregas (OTD, lead time) e aderência usam o período;
+ * WIP e atrasadas são sempre a situação atual.
+ */
+export async function kpis(periodo: number | Periodo = 30) {
   const hoje = hojeNoFuso();
-  const desde = somarDias(hoje, -dias);
+  const { de: desde, ate } = normalizar(periodo);
   const [e] = await sql`
     select count(*)::int as concluidas,
       count(*) filter (where (concluida_em at time zone 'America/Sao_Paulo')::date <= data_necessidade)::int as no_prazo,
       avg(extract(epoch from (concluida_em - liberada_em)) / 86400) filter (where liberada_em is not null) as lead_time_dias
     from ordens_producao where status = 'concluida' and origem = 'pedido'
-      and (concluida_em at time zone 'America/Sao_Paulo')::date >= ${desde}`;
+      and (concluida_em at time zone 'America/Sao_Paulo')::date >= ${desde}
+      and (concluida_em at time zone 'America/Sao_Paulo')::date <= ${ate}`;
   const [w] = await sql`
     select count(*) filter (where status in ('liberada', 'em_processo'))::int as wip,
       count(*) filter (where status in ('firmada', 'liberada', 'em_processo')
         and (data_necessidade < ${hoje} or (fim_previsto at time zone 'America/Sao_Paulo')::date > data_necessidade))::int as atrasadas
     from ordens_producao`;
-  // aderência: programa aprovado da semana anterior (semana fechada)
-  const semAnt = somarDias(segundaDaSemana(hoje), -7);
+  // aderência: programas aprovados de semanas já fechadas dentro do período
+  // (padrão sem período explícito: só a semana passada, como antes)
+  const ultimaFechada = somarDias(segundaDaSemana(somarDias(ate < hoje ? ate : hoje, 1)), -7);
+  const semAnt = typeof periodo === "number" ? somarDias(segundaDaSemana(hoje), -7) : ultimaFechada;
+  const primeira = typeof periodo === "number" ? semAnt : segundaDaSemana(desde);
   const [a] = await sql`
-    select count(*)::int as planejadas,
-      count(*) filter (where t.status = 'concluida' and (t.concluida_em at time zone 'America/Sao_Paulo')::date < ${somarDias(semAnt, 7)})::int as cumpridas
+    select count(*)::int as planejadas, count(distinct p.semana)::int as semanas,
+      count(*) filter (where t.status = 'concluida' and (t.concluida_em at time zone 'America/Sao_Paulo')::date < p.semana + 7)::int as cumpridas
     from programas_semanais p join programa_itens pi on pi.programa_id = p.id join tarefas t on t.id = pi.tarefa_id
-    where p.semana = ${semAnt} and p.status = 'aprovado'`;
+    where p.semana >= ${primeira} and p.semana <= ${semAnt} and p.status = 'aprovado'`;
   return {
     otd: e.concluidas ? e.no_prazo / e.concluidas : null,
     concluidas: e.concluidas as number,
@@ -35,15 +57,24 @@ export async function kpis(dias = 30) {
     atrasadas: w.atrasadas as number,
     aderencia: a.planejadas ? a.cumpridas / a.planejadas : null,
     aderencia_semana: semAnt,
+    aderencia_primeira_semana: primeira,
+    aderencia_semanas: a.semanas as number,
     aderencia_planejadas: a.planejadas as number,
   };
 }
 
-export async function paretoParadas(dias = 30) {
-  const rows = await sql`
+export async function paretoParadas(periodo: number | Periodo = 30) {
+  const rows =
+    typeof periodo === "number"
+      ? await sql`
     select m.descricao, m.tipo, sum(extract(epoch from (coalesce(p.fim, now()) - p.inicio)) / 60) as minutos
     from paradas p join motivos_parada m on m.id = p.motivo_id
-    where p.inicio >= now() - ${`${dias} days`}::interval and m.tipo <> 'planejada'
+    where p.inicio >= now() - ${`${periodo} days`}::interval and m.tipo <> 'planejada'
+    group by m.descricao, m.tipo`
+      : await sql`
+    select m.descricao, m.tipo, sum(extract(epoch from (coalesce(p.fim, now()) - p.inicio)) / 60) as minutos
+    from paradas p join motivos_parada m on m.id = p.motivo_id
+    where (p.inicio at time zone 'America/Sao_Paulo')::date between ${periodo.de} and ${periodo.ate} and m.tipo <> 'planejada'
     group by m.descricao, m.tipo`;
   return pareto(rows.map((r) => ({ chave: r.descricao as string, valor: Number(r.minutos) })));
 }
