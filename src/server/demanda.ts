@@ -6,7 +6,7 @@ import { lerConfigOmie } from '@/integrations/omie/config';
 import { criarClienteOmie } from '@/integrations/omie/sync';
 import { CONTRATOS } from '@/integrations/omie/contratos';
 import type { ClienteOmie } from '@/integrations/omie/cliente';
-import { mapearNota, paginaNotas, type LinhaNota } from '@/integrations/omie/notas';
+import { mapearNota, paginaNotas, reclassificarEntrada, type LinhaNota } from '@/integrations/omie/notas';
 
 export async function demandaDisponivel() {
   const [r] = await sql`select to_regclass('public.demanda_lotes') is not null as ok`;
@@ -18,16 +18,17 @@ async function origemAtual() {
 }
 
 /** Uma página por chamada: retomável e sem disparar nenhuma escrita no Omie. */
-export async function importarPaginaDemanda(opcoes: { cliente?: ClienteOmie; hoje?: string } = {}) {
+export async function importarPaginaDemanda(opcoes: { cliente?: ClienteOmie; hoje?: string } = {}): Promise<{ concluido: boolean; mensagem: string; aguardar?: boolean }> {
   if (!await demandaDisponivel()) throw new Error('Aplique a migração 002_tendencia antes de importar');
   const { cfg, origem } = await origemAtual();
   if (!cfg.appKey || cfg.modo !== 'ativo') throw new Error('Conecte e ative a leitura do Omie antes de importar');
   const hoje = opcoes.hoje ?? hojeNoFuso(), meses = mesesDemanda(hoje);
-  const conexao = await sql.reserve();
   let loteId: number | null = null;
-  try {
-    const [{ ok }] = await conexao`select pg_try_advisory_lock(4250) as ok`;
-    if (!ok) return { concluido: false, mensagem: 'Outra importação histórica está em andamento' };
+  // A transação mantém a conexão física durante a página, inclusive com pooler.
+  // A trava se libera no commit/rollback; não depende de estado de sessão reutilizada.
+  return sql.begin(async conexao => {
+    const [{ ok }] = await conexao`select pg_try_advisory_xact_lock(4252) as ok`;
+    if (!ok) return { concluido: false, aguardar: true, mensagem: 'Outra importação histórica está em andamento' };
     try {
       const lotes = await sql`select * from demanda_lotes where origem = ${origem} and mes >= ${meses[0]} and mes <= ${meses.at(-1)!} order by id desc`;
       let lote = lotes.find(l => !l.concluido_em);
@@ -75,8 +76,8 @@ export async function importarPaginaDemanda(opcoes: { cliente?: ClienteOmie; hoj
     } catch(e) {
       if (loteId) await sql`update demanda_lotes set erro=${(e as Error).message.slice(0,500)}, atualizado_em=now() where id=${loteId}`;
       throw e;
-    } finally { await conexao`select pg_advisory_unlock(4250)`; }
-  } finally { conexao.release(); }
+    }
+  });
 }
 
 export async function lerDemanda() {
@@ -89,6 +90,11 @@ export async function lerDemanda() {
   const ids = lotes.map(l => Number(l.id));
   const linhas = ids.length ? await sql`select d.*, i.id as item_id, i.familia_demanda, i.revisar, i.origem as origem_item
     from demanda_linhas d left join itens i on i.omie_id=d.produto_omie_id where d.lote_id=any(${ids})` : [];
+  // Aplica a mesma regra aos snapshots já importados, sem alterar o registro fiscal persistido.
+  for (const linha of linhas) {
+    const atual = reclassificarEntrada({ natureza: String(linha.natureza), cfop: String(linha.cfop), motivo: String(linha.motivo) });
+    linha.natureza = atual.natureza; linha.motivo = atual.motivo;
+  }
   const [pendente] = await sql`select mes, erro, proxima_pagina, total_paginas, atualizado_em from demanda_lotes
     where origem=${origem} and mes>=${inicio} and concluido_em is null order by id limit 1`;
   return { disponivel: true as const, hoje, lotes, linhas, pendente, conectado: !!cfg.appKey };

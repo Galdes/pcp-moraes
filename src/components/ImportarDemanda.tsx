@@ -18,6 +18,7 @@ export function ImportarDemanda() {
         const r = await importarDemandaAction();
         setMensagem(r.mensagem);
         if (r.concluido || r.erro) break;
+        if ('aguardar' in r && r.aguardar) await new Promise(resolve => setTimeout(resolve, 1500));
       }
     } catch { setMensagem('Conexão interrompida. Você pode retomar a importação.'); }
     finally { setRodando(false); router.refresh(); }
