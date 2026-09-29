@@ -6,10 +6,11 @@ import { ErroDominio } from "@/domain/tipos";
 import { encontrarCiclos } from "@/domain/estrutura";
 import { carregarEstrutura } from "@/server/engenharia";
 import { auditar } from "@/server/auditoria";
+import { demandaDisponivel } from "@/server/demanda";
 
 const TIPOS = ["produto", "conjunto", "peca", "materia_prima", "componente_comprado"];
 
-function camposItem(f: FormData) {
+async function camposItem(f: FormData) {
   const tipo = texto(f, "tipo");
   const origem = texto(f, "origem");
   const politica = texto(f, "politica") || "sob_pedido";
@@ -20,6 +21,7 @@ function camposItem(f: FormData) {
   const max = numero(f, "estoque_max");
   if (politica === "supermercado" && !(max > min)) throw new ErroDominio("Supermercado precisa de máximo maior que o mínimo");
   return {
+    ...(await demandaDisponivel() ? { familia_demanda: texto(f, "familia_demanda").slice(0, 100) } : {}),
     descricao: texto(f, "descricao"),
     unidade: (texto(f, "unidade") || "UN").toUpperCase(),
     tipo,
@@ -37,7 +39,7 @@ function camposItem(f: FormData) {
 export async function novoItemAction(f: FormData) {
   const u = await exigir(...PODE_PLANEJAR);
   await executar("/cadastros/itens", async () => {
-    const c = camposItem(f);
+    const c = await camposItem(f);
     const codigo = texto(f, "codigo");
     if (!codigo || !c.descricao) throw new ErroDominio("Código e descrição são obrigatórios");
     const [r] = await sql`insert into itens ${sql({ codigo, ...c })} returning id`;
@@ -50,7 +52,7 @@ export async function salvarItemAction(f: FormData) {
   const u = await exigir(...PODE_PLANEJAR);
   const id = inteiro(f, "id");
   await executar(`/cadastros/itens/${id}`, async () => {
-    const c = camposItem(f);
+    const c = await camposItem(f);
     await sql`update itens set ${sql({ ...c, revisar: false, ativo: f.get("ativo") === "on" })}, updated_at = now() where id = ${id}`;
     await auditar(u.id, "item", id, "alterado", c);
     return "Item salvo";

@@ -7,7 +7,7 @@ import { useRef } from "react";
  * Mexer nas datas muda o período para "Personalizado"; escolher um período
  * pronto envia na hora.
  */
-export function FiltroPeriodo({ presets, chave, de, ate, hoje }: { presets: [string, string][]; chave: string; de: string; ate: string; hoje: string }) {
+export function FiltroPeriodo({ presets, chave, de, ate, hoje, demanda }: { presets: [string, string][]; chave: string; de: string; ate: string; hoje: string; demanda?: string }) {
   const form = useRef<HTMLFormElement>(null);
   const sel = useRef<HTMLSelectElement>(null);
   const personalizar = () => {
@@ -15,6 +15,7 @@ export function FiltroPeriodo({ presets, chave, de, ate, hoje }: { presets: [str
   };
   return (
     <form ref={form} method="get" className="card mb-4 flex flex-wrap items-end gap-3 px-4 py-3 text-sm">
+      {demanda && <input type="hidden" name="demanda" value={demanda} />}
       <label className="grid gap-0.5">
         <span className="lbl mb-0">Período</span>
         <select

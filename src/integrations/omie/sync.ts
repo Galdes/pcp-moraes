@@ -7,6 +7,7 @@
 // nunca sobrescreve a classificação de PCP (tipo, origem, política, lotes).
 
 import { sql, type Sql } from "@/lib/db";
+import { agregarItensPedido } from "@/domain/tendencia";
 import { hojeNoFuso } from "@/domain/datas";
 import { ClienteOmie, ErroOmie, type ArmazemEstado, type EstadoIntegracao } from "./cliente";
 import { CONTRATOS, contratoLiberado, type NomeContrato } from "./contratos";
@@ -183,7 +184,7 @@ export async function sincronizarPedidos(c: ClienteOmie) {
         on conflict (omie_id) do update set cliente = excluded.cliente, data_entrega = excluded.data_entrega,
           status = excluded.status, updated_at = now()
         returning id`;
-      for (const i of p.itens) {
+      for (const i of agregarItensPedido(p.itens)) {
         await t`insert into pedido_itens (pedido_id, item_id, quantidade)
                 select ${ped.id}, id, ${i.quantidade} from itens where omie_id = ${i.produto_omie_id}
                 on conflict (pedido_id, item_id) do update set quantidade = excluded.quantidade`;

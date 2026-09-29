@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Card, Cabecalho, Kpi, StatusOP, Vazio } from "@/components/ui";
 import { CargaCapacidade, Medidor, ParetoBarras } from "@/components/Graficos";
+import { TendenciaDemanda } from "@/components/TendenciaDemanda";
 import { FiltroPeriodo } from "@/components/FiltroPeriodo";
 import { faltasMaterial, kpis, oeePorSetor, opsAtrasadas, paretoParadas } from "@/server/indicadores";
 import { cargaPorSetor } from "@/server/programacao";
@@ -45,7 +46,8 @@ function resolverPeriodo(sp: Record<string, string | undefined>, hoje: string) {
 
 export default async function Painel({ searchParams }: { searchParams: Promise<Record<string, string | undefined>> }) {
   const hoje = hojeNoFuso();
-  const per = resolverPeriodo(await searchParams, hoje);
+  const sp = await searchParams;
+  const per = resolverPeriodo(sp, hoje);
   const periodo = { de: per.de, ate: per.ate };
   const [k, par, atr, falt, oee, { carga, setores }] = await Promise.all([
     kpis(periodo),
@@ -60,15 +62,17 @@ export default async function Painel({ searchParams }: { searchParams: Promise<R
     <>
       <Cabecalho coord={`Gestão à vista · ${fmtData(hoje)}`} titulo="Painel da produção" sub={<>Entregas, aderência, OEE e paradas: <b>{per.rotulo}</b>{per.chave !== "personalizado" && <> ({fmtData(per.de)} a {fmtData(per.ate)})</>}. WIP, atrasos, faltas e carga: situação atual.</>} />
 
-      <FiltroPeriodo key={`${per.chave}:${per.de}:${per.ate}`} presets={PRESETS} chave={per.chave} de={per.de} ate={per.ate} hoje={hoje} />
+      <FiltroPeriodo key={`${per.chave}:${per.de}:${per.ate}`} presets={PRESETS} chave={per.chave} de={per.de} ate={per.ate} hoje={hoje} demanda={sp.demanda} />
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5">
-        <Kpi rotulo="Entregas no prazo (OTD)" valor={fmtPct(k.otd)} detalhe={`${k.concluidas} máquinas concluídas no período`} tom={k.otd === null ? "neutro" : k.otd >= 0.9 ? "ok" : k.otd >= 0.7 ? "atencao" : "alerta"} />
+        <Kpi rotulo="Entregas no prazo (OTD)" valor={fmtPct(k.otd)} detalhe={`${k.concluidas} OPs de pedido concluídas no período`} tom={k.otd === null ? "neutro" : k.otd >= 0.9 ? "ok" : k.otd >= 0.7 ? "atencao" : "alerta"} />
         <Kpi rotulo="Aderência ao programa" valor={fmtPct(k.aderencia)} detalhe={k.aderencia_planejadas ? (k.aderencia_semanas > 1 ? `${k.aderencia_semanas} semanas fechadas · ${k.aderencia_planejadas} tarefas` : `semana de ${fmtData(k.aderencia_semana)} · ${k.aderencia_planejadas} tarefas`) : "sem programa aprovado em semana fechada do período"} tom={k.aderencia === null ? "neutro" : k.aderencia >= 0.85 ? "ok" : k.aderencia >= 0.7 ? "atencao" : "alerta"} href="/programacao" />
-        <Kpi rotulo="Lead time da máquina" valor={k.lead_time_dias === null ? "–" : `${fmtNum(k.lead_time_dias, 1)} d`} detalhe="da liberação ao fim da montagem (concluídas no período)" />
-        <Kpi rotulo="Máquinas em processo" valor={k.wip} detalhe="OPs liberadas ou em execução" href="/ops?status=abertas" />
+        <Kpi rotulo="Lead time de produção" valor={k.lead_time_dias === null ? "–" : `${fmtNum(k.lead_time_dias, 1)} d`} detalhe="da liberação à conclusão da OP (concluídas no período)" />
+        <Kpi rotulo="OPs em processo" valor={k.wip} detalhe="OPs liberadas ou em execução" href="/ops?status=abertas" />
         <Kpi rotulo="OPs atrasadas ou em risco" valor={k.atrasadas} detalhe="vencidas ou com fim previsto após a promessa" tom={k.atrasadas ? "alerta" : "ok"} href="#atrasadas" />
       </div>
+
+      <div id="tendencia"><TendenciaDemanda filtro={sp.demanda} preservar={sp} /></div>
 
       <div className="mt-4 grid gap-4 xl:grid-cols-3">
         <Card className="xl:col-span-2" titulo="Carga x capacidade por setor" acoes={<Link href="/programacao" className="btn-sec btn-xs">Programação</Link>} corpo="p-0">
@@ -109,7 +113,7 @@ export default async function Painel({ searchParams }: { searchParams: Promise<R
             ) : (
               <table className="tbl">
                 <thead>
-                  <tr><th>OP</th><th>Máquina</th><th>Status</th><th>Prometida</th><th>Fim previsto</th><th>Onde está</th></tr>
+                  <tr><th>OP</th><th>Item</th><th>Status</th><th>Prometida</th><th>Fim previsto</th><th>Onde está</th></tr>
                 </thead>
                 <tbody>
                   {atr.map((o) => (
