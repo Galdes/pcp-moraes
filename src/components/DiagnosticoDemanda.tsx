@@ -3,11 +3,14 @@ import { ImportarDemanda } from './ImportarDemanda';
 import { lerDemanda } from '@/server/demanda';
 import { fmtDataHora, fmtNum } from '@/lib/formato';
 import { mesesDemanda } from '@/domain/tendencia';
+import { usuarioAtual } from '@/server/auth';
+import { prepararDemandaAction } from '@/app/(escritorio)/integracoes/demanda-actions';
 
 export async function DiagnosticoDemanda({ podeImportar }: { podeImportar: boolean }) {
   const dados = await lerDemanda();
+  const admin = !dados.disponivel && (await usuarioAtual())?.perfil === 'admin';
   return <div id="demanda" className="mt-4"><Card titulo="Histórico de demanda · notas fiscais">
-    {!dados.disponivel ? <Vazio>Aplique a migração 002_tendencia antes de importar o histórico.</Vazio> : <>
+    {!dados.disponivel ? <><Vazio>Prepare a base histórica para receber as notas fiscais.</Vazio>{admin && <form action={prepararDemandaAction}><p className="mb-3 text-sm">Cria a estrutura do histórico e o campo de família, preservando os cadastros existentes.</p><button className="btn-pri">Preparar base histórica</button></form>}</> : <>
       <p className="mb-3 text-sm">Importação independente da carteira e das OPs. Cada mês só é publicado após ler todas as páginas. Repetir a importação substitui o snapshot do mês, sem somar vendas novamente.</p>
       {podeImportar && <ImportarDemanda />}
       {dados.pendente && <p className="my-3 text-sm text-atencao">Em andamento: {String(dados.pendente.mes).slice(0,7)} · próxima página {String(dados.pendente.proxima_pagina)}{dados.pendente.erro ? ` · ${String(dados.pendente.erro)}` : ''}</p>}
