@@ -2,6 +2,16 @@
 import { exigir } from '@/server/auth';
 import { importarPaginaDemanda } from '@/server/demanda';
 import { revalidatePath } from 'next/cache';
+import { executar } from '@/lib/acao';
+import { prepararBaseDemanda } from '@/server/preparar-demanda';
+
+export async function prepararDemandaAction() {
+  const usuario = await exigir('admin');
+  await executar('/integracoes', async () => {
+    const aplicada = await prepararBaseDemanda(usuario.id);
+    return aplicada ? 'Base histórica preparada. Agora importe as notas fiscais.' : 'Base histórica já preparada.';
+  });
+}
 
 export async function importarDemandaAction() {
   await exigir('admin', 'pcp');
