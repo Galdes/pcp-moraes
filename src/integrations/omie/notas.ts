@@ -17,6 +17,14 @@ const id = (o: unknown, p: string) => {
 };
 // Lista conservadora. Outras vendas ficam pendentes de revisão, sem virar zero silencioso.
 const CFOPS_VENDA = new Set(['5101','5102','5105','5106','6101','6102','6105','6106','7101','7102']);
+// Tabela CFOP: https://www.gov.br/receitafederal/pt-br/acesso-a-informacao/acoes-e-programas/facilitacao/anexo-ecf-cfop
+const CFOPS_DEVOLUCAO_VENDA = new Set(['1201','1202','1410','1411','2201','2202','2410','2411','3201','3202']);
+export function reclassificarEntrada<T extends { natureza: string; cfop: string; motivo: string }>(linha: T): T {
+  if (linha.natureza !== 'pendente') return linha;
+  if (CFOPS_DEVOLUCAO_VENDA.has(linha.cfop)) return { ...linha, natureza: 'devolucao', motivo: 'Devolução de venda identificada pelo CFOP; separada da venda bruta' };
+  if (/^[123]\d{3}$/.test(linha.cfop)) return { ...linha, natureza: 'excluida', motivo: 'Entrada fiscal; não representa venda de produto' };
+  return linha;
+}
 
 export function paginaNotas(r: Obj) {
   // ClienteOmie converte a resposta explícita de listagem vazia em {}.
@@ -38,12 +46,10 @@ export function mapearNota(n: Obj): LinhaNota[] {
     throw new Error('NF sem identificação ou data válida');
   }
   if (!Array.isArray(n.det) || !n.det.length) throw new Error(`NF ${nf_id}: detalhes dos itens ausentes`);
-  const chaves = new Set<string>();
-  return n.det.map((d: Obj) => {
+  return n.det.map((d: Obj, posicao: number) => {
     // A posição é apenas uma chave dentro do snapshot completo e imutável da NF.
-    const linha_id = String(id(d, 'nfProdInt.nCodItem') ?? `pos-${chaves.size + 1}`);
-    if (chaves.has(linha_id)) throw new Error(`NF ${nf_id}: item duplicado`);
-    chaves.add(linha_id);
+    // O Omie pode repetir nCodItem em detalhes distintos; cada posição deve ser preservada.
+    const linha_id = `${id(d, 'nfProdInt.nCodItem') ?? 'pos'}:${posicao + 1}`;
     const quantidade = numero(d, 'prod.qCom');
     const valor = numero(d, 'prod.vProd') - numero(d, 'prod.vDesc');
     if (!str(d, 'prod.qCom') || !Number.isFinite(quantidade) || quantidade < 0 || !Number.isFinite(valor)) {
@@ -71,8 +77,8 @@ export function mapearNota(n: Obj): LinhaNota[] {
     if (natureza === 'venda' && (!unidade || !id(d, 'nfProdInt.nCodProd'))) {
       natureza = 'pendente'; motivo = 'Produto Omie ou unidade ausente';
     }
-    return { nf_id, linha_id, produto_omie_id: id(d, 'nfProdInt.nCodProd'),
+    return reclassificarEntrada({ nf_id, linha_id, produto_omie_id: id(d, 'nfProdInt.nCodProd'),
       codigo: str(d, 'prod.cProd'), descricao: str(d, 'prod.xProd'), unidade, data_emissao: data,
-      pedido_omie_id: id(n, 'compl.nIdPedido'), cfop, operacao, quantidade, valor, natureza, motivo };
+      pedido_omie_id: id(n, 'compl.nIdPedido'), cfop, operacao, quantidade, valor, natureza, motivo });
   });
 }
