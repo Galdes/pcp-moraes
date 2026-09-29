@@ -3,6 +3,8 @@ import { migrar } from '../scripts/migrate';
 import { sql } from '@/lib/db';
 import { importarPaginaDemanda, lerDemanda, recortarDemanda } from '@/server/demanda';
 import type { ClienteOmie } from '@/integrations/omie/cliente';
+import { prepararBaseDemanda, MIGRACAO_DEMANDA } from '@/server/preparar-demanda';
+import { readFileSync } from 'node:fs';
 
 const url = process.env.DATABASE_URL_TEST ?? 'postgres://pcp:pcp@localhost:5432/pcp_test';
 process.env.DATABASE_URL = url;
@@ -12,6 +14,13 @@ process.env.OMIE_APP_SECRET = 'somente-teste';
 
 beforeAll(async () => {
   await migrar(url, true);
+  expect(MIGRACAO_DEMANDA.trim()).toBe(readFileSync('db/migrations/002_tendencia.sql','utf8').replace(/\r\n/g,'\n').trim());
+  // Somente neste banco de teste descartável: simula a versão anterior em produção.
+  await sql`drop table demanda_linhas, demanda_lotes`;
+  await sql`alter table itens drop column familia_demanda`;
+  await sql`delete from _migracoes where nome='002_tendencia.sql'`;
+  expect(await prepararBaseDemanda(null)).toBe(true);
+  expect(await prepararBaseDemanda(null)).toBe(false);
   await sql`insert into itens(codigo,descricao,unidade,tipo,origem,omie_id,familia_demanda)
     values ('QA-PECA','Peça de teste','UN','peca','fabricado',99,'Peças de teste')`;
 }, 60000);
