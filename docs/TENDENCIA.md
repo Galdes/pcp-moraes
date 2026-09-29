@@ -14,7 +14,7 @@ O painel mostra 24 meses de quantidades faturadas por item ou família comercial
 
 ## Instalação e operação
 
-1. Fazer backup e aplicar `npm run db:migrate` com a `DATABASE_URL` do ambiente correto. Não usar `db:reset` ou `--reset` em produção. A migração 002 é aditiva.
+1. Aplicar `npm run db:migrate` com a `DATABASE_URL` do ambiente correto ou publicar e usar **Integrações → Preparar base histórica**, disponível exclusivamente ao administrador. A ação aplica somente a migração 002, em transação, com trava e registro de auditoria; repetir não duplica a estrutura. Não usar `db:reset` ou `--reset` em produção. A migração 002 é aditiva.
 2. Publicar a aplicação. Sem a migração, o painel informa que a base precisa ser preparada.
 3. Em Integrações, um usuário admin/PCP inicia a importação de demanda. Ela percorre uma página por chamada, pode ser pausada e retomada e não altera pedidos, OPs, estoque ou MRP.
 4. Conferir os totais, exclusões e pendências com o relatório fiscal do Omie antes de usar os dados no planejamento. Validar especialmente kits, CFOPs, cancelamentos e devoluções reais da empresa.
