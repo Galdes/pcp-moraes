@@ -20,6 +20,7 @@ function camposItem(f: FormData) {
   const max = numero(f, "estoque_max");
   if (politica === "supermercado" && !(max > min)) throw new ErroDominio("Supermercado precisa de máximo maior que o mínimo");
   return {
+    familia_demanda: texto(f, "familia_demanda").slice(0, 100),
     descricao: texto(f, "descricao"),
     unidade: (texto(f, "unidade") || "UN").toUpperCase(),
     tipo,
