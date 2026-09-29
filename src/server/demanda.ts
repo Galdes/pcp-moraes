@@ -6,7 +6,7 @@ import { lerConfigOmie } from '@/integrations/omie/config';
 import { criarClienteOmie } from '@/integrations/omie/sync';
 import { CONTRATOS } from '@/integrations/omie/contratos';
 import type { ClienteOmie } from '@/integrations/omie/cliente';
-import { mapearNota, paginaNotas, type LinhaNota } from '@/integrations/omie/notas';
+import { mapearNota, paginaNotas, reclassificarEntrada, type LinhaNota } from '@/integrations/omie/notas';
 
 export async function demandaDisponivel() {
   const [r] = await sql`select to_regclass('public.demanda_lotes') is not null as ok`;
@@ -90,6 +90,11 @@ export async function lerDemanda() {
   const ids = lotes.map(l => Number(l.id));
   const linhas = ids.length ? await sql`select d.*, i.id as item_id, i.familia_demanda, i.revisar, i.origem as origem_item
     from demanda_linhas d left join itens i on i.omie_id=d.produto_omie_id where d.lote_id=any(${ids})` : [];
+  // Aplica a mesma regra aos snapshots já importados, sem alterar o registro fiscal persistido.
+  for (const linha of linhas) {
+    const atual = reclassificarEntrada({ natureza: String(linha.natureza), cfop: String(linha.cfop), motivo: String(linha.motivo) });
+    linha.natureza = atual.natureza; linha.motivo = atual.motivo;
+  }
   const [pendente] = await sql`select mes, erro, proxima_pagina, total_paginas, atualizado_em from demanda_lotes
     where origem=${origem} and mes>=${inicio} and concluido_em is null order by id limit 1`;
   return { disponivel: true as const, hoje, lotes, linhas, pendente, conectado: !!cfg.appKey };
