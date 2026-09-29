@@ -1,6 +1,6 @@
 import { TIPO_ITEM } from "@/lib/formato";
 
-type Item = Partial<Record<"codigo" | "descricao" | "unidade" | "tipo" | "origem" | "politica" | "lead_time_dias" | "estoque_seguranca" | "estoque_min" | "estoque_max" | "lote_minimo" | "lote_multiplo", string | number>>;
+type Item = Partial<Record<"familia_demanda" | "codigo" | "descricao" | "unidade" | "tipo" | "origem" | "politica" | "lead_time_dias" | "estoque_seguranca" | "estoque_min" | "estoque_max" | "lote_minimo" | "lote_multiplo", string | number>>;
 
 export function CamposItem({ i = {}, comCodigo = false }: { i?: Item; comCodigo?: boolean }) {
   return (
@@ -28,6 +28,7 @@ export function CamposItem({ i = {}, comCodigo = false }: { i?: Item; comCodigo?
           <option value="supermercado">Supermercado (repõe por mín/máx)</option>
         </select>
       </div>
+      <div><label className="lbl" htmlFor="familia_demanda">Família de demanda</label><input id="familia_demanda" name="familia_demanda" maxLength={100} defaultValue={i.familia_demanda ?? ""} className="inp" placeholder="ex.: Vibro 810, reposição..." /><p className="mt-1 text-xs text-apagado">Agrupe itens comparáveis. Não altera tipo, origem ou política.</p></div>
       <div><label className="lbl">Lead time (dias)</label><input name="lead_time_dias" type="number" min={0} defaultValue={i.lead_time_dias ?? 0} className="inp" /></div>
       <div><label className="lbl">Estoque de segurança</label><input name="estoque_seguranca" defaultValue={i.estoque_seguranca ?? 0} className="inp" /></div>
       <div><label className="lbl">Supermercado: mínimo</label><input name="estoque_min" defaultValue={i.estoque_min ?? 0} className="inp" /></div>
