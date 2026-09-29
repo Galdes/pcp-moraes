@@ -16,6 +16,13 @@ export interface Contrato {
 }
 
 export const CONTRATOS = {
+  listarNotas: {
+    endpoint: "produtos/nfconsultar/",
+    call: "ListarNF",
+    escrita: false,
+    verificado: true,
+    fonte: "Documentação oficial NFConsultar: dEmiInicial/dEmiFinal, tpAmb, cDetalhesPedido, nfCadastro (29/09/2026)",
+  },
   listarProdutos: {
     endpoint: "geral/produtos/",
     call: "ListarProdutos",
