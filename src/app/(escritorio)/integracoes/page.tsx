@@ -1,3 +1,4 @@
+import { DiagnosticoDemanda } from "@/components/DiagnosticoDemanda";
 import { sql } from "@/lib/db";
 import { Aviso, Cabecalho, Card, Vazio } from "@/components/ui";
 import { exigir, ESCRITORIO } from "@/server/auth";
@@ -174,6 +175,8 @@ export default async function Integracoes({ searchParams }: { searchParams: Prom
           )}
         </Card>
       </div>
+
+      <DiagnosticoDemanda podeImportar={admin || usuario.perfil === "pcp"} />
 
       <Card titulo="Fila de envios ao Omie" className="mt-4" corpo="p-0">
         {outbox.length === 0 ? <Vazio>Nenhum envio.</Vazio> : (
