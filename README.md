@@ -80,6 +80,8 @@ Proteções embutidas: limite por método por minuto (padrão 200; Omie permite 
 5. Liste os métodos de escrita validados em `OMIE_CONTRATOS_VALIDADOS` (ex.: `ConcluirOrdemProducao,IncluirReq`). Métodos de escrita não validados **nunca** são chamados.
 6. Mude para `OMIE_MODO=ativo`. O agendador chama `POST /api/cron/omie` com `Authorization: Bearer CRON_SECRET`.
 
+**Na Vercel (plano Hobby):** não há o container `cron` do docker-compose e o Cron da Vercel só roda 1x/dia. O agendamento fica no GitHub Actions (`.github/workflows/agendador-omie.yml`, a cada 10 min). Configure o secret `CRON_SECRET` no repositório com o mesmo valor da variável `CRON_SECRET` da Vercel. Cada execução trabalha ~45 s (limite de 60 s da Vercel); o que não terminar (estruturas, carga inicial de produtos) continua na próxima, a partir de onde parou.
+
 Itens novos vindos do Omie entram marcados "revisar" (tipo, origem e política são deduzidos). A tela Qualidade dos dados lista o que falta.
 
 ## TV do chão de fábrica
