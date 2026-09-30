@@ -77,6 +77,57 @@ async function marcar(entidade: string, ok: boolean, mensagem: string) {
       ultimo_sucesso = case when ${ok} then now() else integracao_estado.ultimo_sucesso end, mensagem = excluded.mensagem`;
 }
 
+// ---------- execução em fatias (hospedagem serverless) ----------
+// Na Vercel cada execução tem tempo limitado. As tarefas longas param quando o
+// prazo acaba, gravam onde pararam (cursor) e continuam na próxima execução.
+export interface Prazo {
+  ate: number; // epoch ms; Infinity = sem limite
+}
+const SEM_PRAZO: Prazo = { ate: Infinity };
+const esgotado = (p: Prazo, folgaMs = 0) => Date.now() + folgaMs >= p.ate;
+
+/** Sinaliza que a tarefa avançou, mas ainda não terminou (continua na próxima execução). */
+export class SincronizacaoParcial extends Error {
+  constructor(msg: string) {
+    super(msg);
+    this.name = "SincronizacaoParcial";
+  }
+}
+
+async function lerCursor<T>(ent: string): Promise<T | null> {
+  const [r] = await sql`select mensagem from integracao_estado where entidade = ${`cursor:${ent}`}`;
+  if (!r?.mensagem) return null;
+  try {
+    return JSON.parse(r.mensagem as string) as T;
+  } catch {
+    return null;
+  }
+}
+async function salvarCursor(ent: string, valor: unknown) {
+  const texto = valor === null ? null : JSON.stringify(valor);
+  await sql`insert into integracao_estado (entidade, mensagem, ultima_execucao) values (${`cursor:${ent}`}, ${texto}, now())
+            on conflict (entidade) do update set mensagem = excluded.mensagem, ultima_execucao = now()`;
+}
+
+/** Percorre as páginas a partir de `inicio`; para quando o prazo acaba. */
+async function* paginasDesde(
+  c: ClienteOmie,
+  contrato: (typeof CONTRATOS)[NomeContrato],
+  montar: (pagina: number) => Record<string, unknown>,
+  extrair: (r: Record<string, unknown>) => { registros: Record<string, unknown>[]; totalPaginas: number },
+  inicio: number,
+) {
+  let pagina = inicio;
+  for (;;) {
+    const resp = await c.chamar<Record<string, unknown>>(contrato, montar(pagina), { listagem: true });
+    const { registros, totalPaginas } = extrair(resp);
+    const ultima = pagina >= (totalPaginas || 1);
+    yield { pagina, totalPaginas: totalPaginas || 1, registros, ultima };
+    if (ultima) return;
+    pagina++;
+  }
+}
+
 // ---------- classificação de item novo vindo do Omie ----------
 export function classificarNovo(p: { codigo: string; descricao: string; tipoItem?: string }) {
   const d = p.descricao.toUpperCase();
@@ -88,36 +139,59 @@ export function classificarNovo(p: { codigo: string; descricao: string; tipoItem
 }
 
 // ---------- leituras ----------
-export async function sincronizarProdutos(c: ClienteOmie) {
-  let novos = 0,
-    atualizados = 0;
-  for await (const bruto of c.paginar(
+export async function sincronizarProdutos(c: ClienteOmie, prazo: Prazo = SEM_PRAZO) {
+  const cur = (await lerCursor<{ pagina: number; novos: number; atualizados: number }>("produtos")) ?? { pagina: 1, novos: 0, atualizados: 0 };
+  let { novos, atualizados } = cur;
+  for await (const pg of paginasDesde(
+    c,
     CONTRATOS.listarProdutos,
     (pagina) => ({ pagina, registros_por_pagina: 100, apenas_importado_api: "N", filtrar_apenas_omiepdv: "N" }),
     extrairListaProdutos,
+    cur.pagina,
   )) {
-    const p = mapearProduto(bruto);
-    if (!p) continue;
-    const cls = classificarNovo({ ...p, tipoItem: (bruto as Record<string, string>).tipoItem });
-    const [r] = await sql`
-      insert into itens (codigo, descricao, unidade, tipo, origem, omie_id, revisar, ativo)
-      values (${p.codigo}, ${p.descricao}, ${p.unidade}, ${cls.tipo}, ${cls.origem}, ${p.omie_id}, true, ${!p.inativo})
-      on conflict (codigo) do update set descricao = excluded.descricao, unidade = excluded.unidade,
-        omie_id = excluded.omie_id, ativo = excluded.ativo, updated_at = now()
-      returning (xmax = 0) as inserido`;
-    if (r.inserido) novos++;
-    else atualizados++;
+    const porCodigo = new Map<string, Record<string, unknown>>();
+    for (const bruto of pg.registros) {
+      const p = mapearProduto(bruto);
+      if (!p) continue;
+      const cls = classificarNovo({ ...p, tipoItem: (bruto as Record<string, string>).tipoItem });
+      porCodigo.set(p.codigo, { codigo: p.codigo, descricao: p.descricao, unidade: p.unidade, tipo: cls.tipo, origem: cls.origem, omie_id: p.omie_id, revisar: true, ativo: !p.inativo });
+    }
+    const linhas = [...porCodigo.values()];
+    if (linhas.length) {
+      // um único comando por página (antes: um insert por produto)
+      const r = await sql`
+        insert into itens ${sql(linhas as never, "codigo", "descricao", "unidade", "tipo", "origem", "omie_id", "revisar", "ativo")}
+        on conflict (codigo) do update set descricao = excluded.descricao, unidade = excluded.unidade,
+          omie_id = excluded.omie_id, ativo = excluded.ativo, updated_at = now()
+        returning (xmax = 0) as inserido`;
+      for (const x of r) x.inserido ? novos++ : atualizados++;
+    }
+    if (pg.ultima) break;
+    if (esgotado(prazo)) {
+      await salvarCursor("produtos", { pagina: pg.pagina + 1, novos, atualizados });
+      throw new SincronizacaoParcial(`em andamento: página ${pg.pagina} de ${pg.totalPaginas} (continua na próxima execução)`);
+    }
   }
+  await salvarCursor("produtos", null);
   return `${novos} novos, ${atualizados} atualizados`;
 }
 
-export async function sincronizarEstrutura(c: ClienteOmie) {
+export async function sincronizarEstrutura(c: ClienteOmie, prazo: Prazo = SEM_PRAZO) {
+  // uma chamada por item fabricado: centenas de chamadas, então anda em fatias
+  const cur = (await lerCursor<{ depoisDe: number; lidas: number; linhas: number; avisos: number }>("estrutura")) ?? { depoisDe: 0, lidas: 0, linhas: 0, avisos: 0 };
   const pais = await sql<{ id: number; codigo: string; omie_id: number }[]>`
-    select id, codigo, omie_id from itens where ativo and origem = 'fabricado' and omie_id is not null`;
+    select id, codigo, omie_id from itens where ativo and origem = 'fabricado' and omie_id is not null and id > ${cur.depoisDe}
+    order by id`;
   const porOmie = new Map((await sql<{ id: number; omie_id: number }[]>`select id, omie_id from itens where omie_id is not null`).map((r) => [r.omie_id, r.id]));
   let linhas = 0;
   const avisos: string[] = [];
+  let lidas = 0;
   for (const pai of pais) {
+    if (lidas > 0 && esgotado(prazo, 3000)) {
+      await salvarCursor("estrutura", { depoisDe: pais[lidas - 1].id, lidas: cur.lidas + lidas, linhas: cur.linhas + linhas, avisos: cur.avisos + avisos.length });
+      throw new SincronizacaoParcial(`em andamento: ${cur.lidas + lidas} estruturas lidas, faltam ${pais.length - lidas} (continua na próxima execução)`);
+    }
+    lidas++;
     const resp = await c.chamar<Record<string, unknown>>(CONTRATOS.consultarEstrutura, { idProduto: pai.omie_id }, { listagem: true });
     const est = mapearEstrutura(resp);
     await sql.begin(async (tx) => {
@@ -137,61 +211,98 @@ export async function sincronizarEstrutura(c: ClienteOmie) {
       }
     });
   }
-  return `${pais.length} estruturas lidas, ${linhas} linhas${avisos.length ? `; ${avisos.length} avisos: ${avisos.slice(0, 5).join("; ")}` : ""}`;
+  await salvarCursor("estrutura", null);
+  const totAvisos = cur.avisos + avisos.length;
+  return `${cur.lidas + lidas} estruturas lidas, ${cur.linhas + linhas} linhas${totAvisos ? `; ${totAvisos} avisos${avisos.length ? `: ${avisos.slice(0, 5).join("; ")}` : ""}` : ""}`;
 }
 
-export async function sincronizarEstoque(c: ClienteOmie) {
+export async function sincronizarEstoque(c: ClienteOmie, prazo: Prazo = SEM_PRAZO) {
   const local = process.env.OMIE_LOCAL_ESTOQUE ? Number(process.env.OMIE_LOCAL_ESTOQUE) : undefined;
-  const saldos: { omie_id: number; saldo: number }[] = [];
   const hoje = hojeNoFuso().split("-").reverse().join("/");
-  for await (const b of c.paginar(
+  // a leitura pode levar mais de uma execução: o que já foi lido fica no cursor (mesmo dia)
+  const salvo = await lerCursor<{ dia: string; pagina: number; saldos: [number, number][] }>("estoque");
+  const cur = salvo && salvo.dia === hoje ? salvo : { dia: hoje, pagina: 1, saldos: [] as [number, number][] };
+  const saldos: { omie_id: number; saldo: number }[] = cur.saldos.map(([omie_id, saldo]) => ({ omie_id, saldo }));
+  for await (const pg of paginasDesde(
+    c,
     CONTRATOS.listarPosicaoEstoque,
     (nPagina) => ({ nPagina, nRegPorPagina: 100, dDataPosicao: hoje, cExibeTodos: "N", ...(local ? { codigo_local_estoque: local } : {}) }),
-    extrairPosicaoEstoque,
+    extrairPosicaoEstoque as never,
+    cur.pagina,
   )) {
-    const s = mapearSaldo(b);
-    if (s) saldos.push(s);
+    for (const b of pg.registros) {
+      const s = mapearSaldo(b as never);
+      if (s) saldos.push(s);
+    }
+    if (pg.ultima) break;
+    if (esgotado(prazo)) {
+      await salvarCursor("estoque", { dia: hoje, pagina: pg.pagina + 1, saldos: saldos.map((s) => [s.omie_id, s.saldo]) });
+      throw new SincronizacaoParcial(`em andamento: página ${pg.pagina} de ${pg.totalPaginas} (continua na próxima execução)`);
+    }
   }
   // só grava depois de ler todas as páginas: nunca deixa o estoque pela metade
   await sql.begin(async (tx) => {
     const t = tx as unknown as Sql;
     await t`update estoque_saldos set quantidade = 0, atualizado_em = now() where fonte = 'omie'`;
-    for (const s of saldos) {
+    // um comando só para todos os saldos (antes: um insert por item)
+    const ultimo = new Map(saldos.map((s) => [s.omie_id, s.saldo]));
+    if (ultimo.size) {
       await t`insert into estoque_saldos (item_id, quantidade, fonte, atualizado_em)
-              select id, ${s.saldo}, 'omie', now() from itens where omie_id = ${s.omie_id}
+              select i.id, x.saldo, 'omie', now()
+              from unnest(${[...ultimo.keys()]}::bigint[], ${[...ultimo.values()]}::numeric[]) as x(omie_id, saldo)
+              join itens i on i.omie_id = x.omie_id
               on conflict (item_id) do update set quantidade = excluded.quantidade, fonte = 'omie', atualizado_em = now()`;
     }
   });
+  await salvarCursor("estoque", null);
   return `${saldos.length} saldos`;
 }
 
-export async function sincronizarPedidos(c: ClienteOmie) {
+export async function sincronizarPedidos(c: ClienteOmie, prazo: Prazo = SEM_PRAZO) {
   const faturado = (process.env.OMIE_ETAPAS_FATURADO ?? "60,70,80").split(",").map((s) => s.trim());
-  let n = 0;
-  for await (const b of c.paginar(
+  const cur = (await lerCursor<{ pagina: number; n: number }>("pedidos")) ?? { pagina: 1, n: 0 };
+  let n = cur.n;
+  for await (const pg of paginasDesde(
+    c,
     CONTRATOS.listarPedidosVenda,
     (pagina) => ({ pagina, registros_por_pagina: 100, apenas_importado_api: "N" }),
     extrairListaPedidos,
+    cur.pagina,
   )) {
-    const p = mapearPedido(b);
-    if (!p || !p.data_entrega) continue;
-    const status = p.cancelado ? "cancelado" : faturado.includes(p.etapa) ? "atendido" : "aberto";
-    await sql.begin(async (tx) => {
-      const t = tx as unknown as Sql;
-      const [ped] = await t`
-        insert into pedidos_venda (numero, cliente, data_emissao, data_entrega, status, omie_id)
-        values (${p.numero}, ${p.cliente}, ${p.data_emissao ?? p.data_entrega}, ${p.data_entrega}, ${status}, ${p.omie_id})
-        on conflict (omie_id) do update set cliente = excluded.cliente, data_entrega = excluded.data_entrega,
-          status = excluded.status, updated_at = now()
-        returning id`;
-      for (const i of agregarItensPedido(p.itens)) {
-        await t`insert into pedido_itens (pedido_id, item_id, quantidade)
-                select ${ped.id}, id, ${i.quantidade} from itens where omie_id = ${i.produto_omie_id}
-                on conflict (pedido_id, item_id) do update set quantidade = excluded.quantidade`;
-      }
-    });
-    n++;
+    for (const b of pg.registros) {
+      const p = mapearPedido(b);
+      if (!p || !p.data_entrega) continue;
+      const status = p.cancelado ? "cancelado" : faturado.includes(p.etapa) ? "atendido" : "aberto";
+      await sql.begin(async (tx) => {
+        const t = tx as unknown as Sql;
+        // pedido digitado à mão no PCP com o mesmo número: passa a ser este pedido do Omie
+        await t`update pedidos_venda set omie_id = ${p.omie_id}, updated_at = now()
+                where numero = ${p.numero} and omie_id is null
+                  and not exists (select 1 from pedidos_venda where omie_id = ${p.omie_id})`;
+        // número repetido em outro pedido do Omie: grava com o código do Omie para não colidir
+        const [outro] = await t`select 1 from pedidos_venda where numero = ${p.numero} and omie_id <> ${p.omie_id}`;
+        const numero = outro ? `${p.numero} (Omie ${p.omie_id})` : p.numero;
+        const [ped] = await t`
+          insert into pedidos_venda (numero, cliente, data_emissao, data_entrega, status, omie_id)
+          values (${numero}, ${p.cliente}, ${p.data_emissao ?? p.data_entrega}, ${p.data_entrega}, ${status}, ${p.omie_id})
+          on conflict (omie_id) do update set cliente = excluded.cliente, data_entrega = excluded.data_entrega,
+            status = excluded.status, updated_at = now()
+          returning id`;
+        for (const i of agregarItensPedido(p.itens)) {
+          await t`insert into pedido_itens (pedido_id, item_id, quantidade)
+                  select ${ped.id}, id, ${i.quantidade} from itens where omie_id = ${i.produto_omie_id}
+                  on conflict (pedido_id, item_id) do update set quantidade = excluded.quantidade`;
+        }
+      });
+      n++;
+    }
+    if (pg.ultima) break;
+    if (esgotado(prazo)) {
+      await salvarCursor("pedidos", { pagina: pg.pagina + 1, n });
+      throw new SincronizacaoParcial(`em andamento: página ${pg.pagina} de ${pg.totalPaginas} (continua na próxima execução)`);
+    }
   }
+  await salvarCursor("pedidos", null);
   return `${n} pedidos`;
 }
 
@@ -315,42 +426,46 @@ async function falhar(o: ItemOutbox, msg: string, definitivo: boolean) {
 // ---------- orquestração ----------
 const INTERVALOS_MIN: Record<string, number> = {
   produtos: 60,
-  estrutura: 24 * 60,
   estoque: 10,
   pedidos: 10,
   compras: 30,
   outbox: 0,
+  estrutura: 24 * 60, // por último: é a mais longa e anda em fatias
 };
 
-const TAREFAS: Record<string, (c: ClienteOmie) => Promise<string>> = {
+const TAREFAS: Record<string, (c: ClienteOmie, prazo: Prazo) => Promise<string>> = {
   produtos: sincronizarProdutos,
-  estrutura: sincronizarEstrutura,
   estoque: sincronizarEstoque,
   pedidos: sincronizarPedidos,
-  compras: sincronizarCompras,
+  compras: (c) => sincronizarCompras(c),
   outbox: (c) => processarOutbox(c),
+  estrutura: sincronizarEstrutura,
 };
 
-export async function executarSincronizacao(opcoes: { forcar?: string[]; cliente?: ClienteOmie } = {}) {
+/** Tempo de trabalho por execução. A rota tem maxDuration = 60 s (limite do plano Hobby da Vercel). */
+const ORCAMENTO_MS = Number(process.env.OMIE_ORCAMENTO_MS || 45_000);
+/** Trava de uma sincronização por vez. Expira sozinha se a função for encerrada no meio. */
+const TRAVA_SEG = 120;
+
+export async function executarSincronizacao(opcoes: { forcar?: string[]; cliente?: ClienteOmie; orcamentoMs?: number } = {}) {
   const modo = await modoOmie();
   if (modo !== "ativo") return [{ entidade: "omie", ok: false, mensagem: `Integração em modo "${modo}": nada foi chamado` }];
-  // uma sincronização por vez (cron, botão manual e execuções longas não se sobrepõem):
-  // a trava é de sessão, então usa uma conexão reservada do pool
-  const conexao = await sql.reserve();
+  // trava por linha no banco (e não pg_advisory_lock de sessão, que fica presa
+  // quando o banco usa pooler, como Neon/Supabase na Vercel)
+  await sql`insert into integracao_estado (entidade) values ('trava:omie') on conflict do nothing`;
+  const [pegou] = await sql`
+    update integracao_estado set bloqueado_ate = now() + ${`${TRAVA_SEG} seconds`}::interval
+    where entidade = 'trava:omie' and (bloqueado_ate is null or bloqueado_ate < now()) returning 1`;
+  if (!pegou) return [{ entidade: "omie", ok: false, mensagem: "Já existe uma sincronização em andamento" }];
   try {
-    const [{ ok }] = await conexao`select pg_try_advisory_lock(4244) as ok`;
-    if (!ok) return [{ entidade: "omie", ok: false, mensagem: "Já existe uma sincronização em andamento" }];
-    try {
-      return await sincronizarSemTrava(opcoes);
-    } finally {
-      await conexao`select pg_advisory_unlock(4244)`;
-    }
+    return await sincronizarSemTrava(opcoes);
   } finally {
-    conexao.release();
+    await sql`update integracao_estado set bloqueado_ate = null where entidade = 'trava:omie'`;
   }
 }
 
-async function sincronizarSemTrava(opcoes: { forcar?: string[]; cliente?: ClienteOmie }) {
+async function sincronizarSemTrava(opcoes: { forcar?: string[]; cliente?: ClienteOmie; orcamentoMs?: number }) {
+  const prazo: Prazo = { ate: Date.now() + (opcoes.orcamentoMs ?? ORCAMENTO_MS) };
   const c = opcoes.cliente ?? (await criarClienteOmie());
   const estados = new Map(
     (await sql`select entidade, ultimo_sucesso from integracao_estado where entidade like 'omie:%'`).map((r) => [r.entidade as string, r.ultimo_sucesso as Date | null]),
@@ -360,13 +475,23 @@ async function sincronizarSemTrava(opcoes: { forcar?: string[]; cliente?: Client
     const ultimo = estados.get(`omie:${ent}`);
     const vencido = !ultimo || Date.now() - new Date(ultimo).getTime() >= INTERVALOS_MIN[ent] * 60_000;
     if (!(opcoes.forcar?.includes(ent) || (!opcoes.forcar && vencido))) continue;
+    if (esgotado(prazo, 8000)) {
+      resultado.push({ entidade: ent, ok: false, mensagem: "sem tempo nesta execução; fica para a próxima" });
+      continue;
+    }
     try {
-      const msg = await fn(c);
+      const msg = await fn(c, prazo);
       await marcar(`omie:${ent}`, true, msg);
       if (ent !== "outbox") await log(ent, "entrada", "ok", msg);
       resultado.push({ entidade: ent, ok: true, mensagem: msg });
     } catch (e) {
       const msg = (e as Error).message;
+      if (e instanceof SincronizacaoParcial) {
+        // avançou, mas não terminou: não conta como erro e não atualiza o último sucesso
+        await marcar(`omie:${ent}`, false, msg);
+        resultado.push({ entidade: ent, ok: true, mensagem: msg });
+        continue;
+      }
       await marcar(`omie:${ent}`, false, msg);
       await log(ent, ent === "outbox" ? "saida" : "entrada", "erro", msg);
       resultado.push({ entidade: ent, ok: false, mensagem: msg });

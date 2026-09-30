@@ -16,10 +16,9 @@ import { executarMRP, converterSugestaoEmOP, enviarRequisicaoCompra } from "@/se
 import { reprogramar, cargaPorSetor, aprovarPrograma } from "@/server/programacao";
 import { kpis, paretoParadas, oeePorSetor } from "@/server/indicadores";
 import { checagens } from "@/server/qualidade";
-import { resumoParaMonday } from "@/integrations/monday/resumo";
 import { ClienteOmie, ErroOmie, type EstadoIntegracao } from "@/integrations/omie/cliente";
 import { CONTRATOS } from "@/integrations/omie/contratos";
-import { processarOutbox, sincronizarEstoque, sincronizarPedidos, sincronizarProdutos } from "@/integrations/omie/sync";
+import { executarSincronizacao, processarOutbox, sincronizarEstoque, sincronizarPedidos, sincronizarProdutos, SincronizacaoParcial } from "@/integrations/omie/sync";
 import { hojeNoFuso, somarDias } from "@/domain/datas";
 
 let admin: number;
@@ -146,7 +145,7 @@ describe("planejamento", () => {
     expect(r.tarefas).toBeGreaterThan(0);
   });
 
-  it("indicadores, qualidade de dados e resumo Monday", async () => {
+  it("indicadores e qualidade de dados", async () => {
     const k = await kpis();
     expect(k.concluidas).toBeGreaterThanOrEqual(2);
     expect(k.otd).toBe(0.5); // uma no prazo, outra atrasada (histórico demo)
@@ -158,8 +157,6 @@ describe("planejamento", () => {
     const q = await checagens();
     expect(q.ciclos).toEqual([]);
     expect(q.semOmie.length).toBeGreaterThan(0);
-    const m = await resumoParaMonday();
-    expect(m.maquinas.some((x) => x.status === "Em execução")).toBe(true);
   });
 });
 
@@ -259,6 +256,71 @@ describe("cliente Omie", () => {
     await sincronizarPedidos(c);
     const [ped] = await sql`select p.numero, p.data_entrega, pi.quantidade from pedidos_venda p join pedido_itens pi on pi.pedido_id = p.id where p.omie_id = 777`;
     expect(ped).toMatchObject({ numero: "4512", data_entrega: "2026-11-30", quantidade: 3 });
+  });
+
+  it("produtos em fatias: para no prazo, grava onde parou e continua na próxima execução", async () => {
+    const paginasPedidas: number[] = [];
+    const c = new ClienteOmie({
+      appKey: "k",
+      appSecret: "s",
+      estado: memoria(),
+      fetchFn: async (_u, init) => {
+        const pagina = JSON.parse(String(init!.body)).param[0].pagina as number;
+        paginasPedidas.push(pagina);
+        return resposta({
+          pagina,
+          total_de_paginas: 3,
+          produto_servico_cadastro: [{ codigo_produto: 910000 + pagina, codigo: `FATIA-${pagina}`, descricao: `PECA FATIA ${pagina}`, unidade: "UN" }],
+        });
+      },
+    });
+    const vencido = { ate: Date.now() - 1 }; // prazo já esgotado: faz uma página e para
+    await expect(sincronizarProdutos(c, vencido)).rejects.toBeInstanceOf(SincronizacaoParcial);
+    await expect(sincronizarProdutos(c, vencido)).rejects.toBeInstanceOf(SincronizacaoParcial);
+    expect(await sincronizarProdutos(c)).toBe("3 novos, 0 atualizados"); // total acumulado entre execuções
+    expect(paginasPedidas).toEqual([1, 2, 3]); // nunca relê página
+    const [{ n }] = await sql`select count(*)::int as n from itens where codigo like 'FATIA-%'`;
+    expect(n).toBe(3);
+    const [cur] = await sql`select mensagem from integracao_estado where entidade = 'cursor:produtos'`;
+    expect(cur.mensagem).toBeNull();
+  });
+
+  it("pedido do Omie com número já usado não derruba a sincronização", async () => {
+    const vibro = await item("01.10.20.399");
+    await sql`insert into pedidos_venda (numero, cliente, data_entrega) values ('9001', 'Digitado no PCP', '2026-12-01')`;
+    await sql`insert into pedidos_venda (numero, cliente, data_entrega, omie_id) values ('9002', 'Outro do Omie', '2026-12-01', 555001)`;
+    const c = new ClienteOmie({
+      appKey: "k",
+      appSecret: "s",
+      estado: memoria(),
+      fetchFn: async () =>
+        resposta({
+          pagina: 1,
+          total_de_paginas: 1,
+          pedido_venda_produto: [
+            { cabecalho: { codigo_pedido: 555010, numero_pedido: "9001", data_previsao: "10/12/2026", etapa: "20" }, det: [{ produto: { codigo_produto: 900001, quantidade: 1 } }] },
+            { cabecalho: { codigo_pedido: 555020, numero_pedido: "9002", data_previsao: "11/12/2026", etapa: "20" }, det: [{ produto: { codigo_produto: 900001, quantidade: 2 } }] },
+          ],
+        }),
+    });
+    expect(await sincronizarPedidos(c)).toBe("2 pedidos");
+    const [manual] = await sql`select omie_id, data_entrega from pedidos_venda where numero = '9001'`;
+    expect(manual).toMatchObject({ omie_id: 555010, data_entrega: "2026-12-10" }); // o digitado passa a ser o do Omie
+    const [repetido] = await sql`select numero from pedidos_venda where omie_id = 555020`;
+    expect(repetido.numero).toBe("9002 (Omie 555020)");
+    const [{ n }] = await sql`select count(*)::int as n from pedido_itens where item_id = ${vibro} and pedido_id in (select id from pedidos_venda where omie_id in (555010, 555020))`;
+    expect(n).toBe(2);
+  });
+
+  it("uma sincronização por vez, com trava que expira sozinha", async () => {
+    await sql`insert into integracao_estado (entidade, bloqueado_ate) values ('trava:omie', now() + interval '1 minute')
+              on conflict (entidade) do update set bloqueado_ate = excluded.bloqueado_ate`;
+    const c = new ClienteOmie({ appKey: "k", appSecret: "s", estado: memoria(), fetchFn: async () => resposta({}) });
+    expect(await executarSincronizacao({ forcar: [], cliente: c })).toEqual([{ entidade: "omie", ok: false, mensagem: "Já existe uma sincronização em andamento" }]);
+    await sql`update integracao_estado set bloqueado_ate = now() - interval '1 second' where entidade = 'trava:omie'`; // função encerrada no meio
+    expect(await executarSincronizacao({ forcar: [], cliente: c })).toEqual([]); // pegou a trava vencida
+    const [t] = await sql`select bloqueado_ate from integracao_estado where entidade = 'trava:omie'`;
+    expect(t.bloqueado_ate).toBeNull();
   });
 
   it("em escrita, 'não encontrado' do Omie é erro (não sucesso silencioso)", async () => {

@@ -5,11 +5,11 @@ import { exigir, ESCRITORIO } from "@/server/auth";
 import { CONTRATOS, contratoLiberado, type NomeContrato } from "@/integrations/omie/contratos";
 import { montarChamada } from "@/integrations/omie/sync";
 import { lerConfigOmie } from "@/integrations/omie/config";
-import { resumoParaMonday } from "@/integrations/monday/resumo";
 import { fmtDataHora } from "@/lib/formato";
 import { ativarOmieAction, conectarOmieAction, desativarOmieAction, desconectarOmieAction, modoOmieAction, outboxAction, sincronizarAction, testarOmieAction, validadosOmieAction } from "./actions";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 60; // vale também para o botão "Sincronizar tudo agora"
 export const metadata = { title: "Integrações" };
 
 const ENTIDADES: [string, string, string][] = [
@@ -34,7 +34,6 @@ export default async function Integracoes({ searchParams }: { searchParams: Prom
   const previas = await Promise.all(outbox.filter((o) => o.status !== "enviado").slice(0, 10).map(async (o) => [o.id, await montarChamada(o as never)] as const));
   const prev = new Map(previas);
   const log = await sql`select * from integracao_log order by id desc limit 40`;
-  const monday = await resumoParaMonday();
   const corModo = { ativo: "bg-emerald-100 text-emerald-800", simulacao: "bg-amber-100 text-amber-800", desligado: "bg-slate-200 text-slate-600" }[modo];
 
   return (
@@ -214,15 +213,7 @@ export default async function Integracoes({ searchParams }: { searchParams: Prom
         )}
       </Card>
 
-      <div className="mt-4 grid gap-4 xl:grid-cols-2">
-        <Card titulo="Exportação executiva (via N8N)">
-          <p className="text-sm">O N8N lê <code className="rounded bg-carta px-1">GET /api/export/monday</code> com o cabeçalho <code className="rounded bg-carta px-1">Authorization: Bearer EXPORT_TOKEN</code> e atualiza um item por máquina no quadro do Monday.</p>
-          <p className="mt-2 text-sm">Token {process.env.EXPORT_TOKEN && process.env.EXPORT_TOKEN.length >= 16 ? "configurado" : <span className="text-alerta">não configurado (mín. 16 caracteres)</span>}. Máquinas no resumo agora: {monday.maquinas.length}.</p>
-          <details className="mt-2">
-            <summary className="cursor-pointer text-sm text-apagado">prévia do JSON</summary>
-            <pre className="mt-1 max-h-72 overflow-auto rounded bg-carta p-2 text-[11px]">{JSON.stringify({ ...monday, maquinas: monday.maquinas.slice(0, 3) }, null, 2)}</pre>
-          </details>
-        </Card>
+      <div className="mt-4">
         <Card titulo="Registro das integrações" corpo="p-0">
           {log.length === 0 ? <Vazio>Sem registros.</Vazio> : (
             <ul className="max-h-80 divide-y divide-linha overflow-auto text-xs">

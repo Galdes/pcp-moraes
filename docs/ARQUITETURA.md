@@ -19,14 +19,13 @@ flowchart LR
   end
   subgraph PCP[Sistema PCP · Next.js monolito modular]
     UI[Telas + ações de servidor]
-    API[/api/posto · /api/cron · /api/export/]
+    API[/api/posto · /api/cron/]
     D[Domínio puro<br/>explosão · MRP · kitting · programação · OEE]
     S[Serviços<br/>OPs · posto · programação · MRP · indicadores]
     I[Integração Omie<br/>cliente com limite + disjuntor + outbox]
   end
   DB[(PostgreSQL)]
   OMIE[(Omie ERP)]
-  N8N[N8N] --> MON[(Monday · visão executiva)]
   CRON[Agendador] -->|POST /api/cron/*| API
   T --> API
   TV --> UI
@@ -36,7 +35,6 @@ flowchart LR
   S --> DB
   I --> DB
   I <-->|API REST| OMIE
-  N8N -->|GET /api/export/monday| API
 ```
 
 ## 3. Decisões (ADRs curtos)
