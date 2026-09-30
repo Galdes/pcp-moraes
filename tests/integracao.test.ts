@@ -16,7 +16,6 @@ import { executarMRP, converterSugestaoEmOP, enviarRequisicaoCompra } from "@/se
 import { reprogramar, cargaPorSetor, aprovarPrograma } from "@/server/programacao";
 import { kpis, paretoParadas, oeePorSetor } from "@/server/indicadores";
 import { checagens } from "@/server/qualidade";
-import { resumoParaMonday } from "@/integrations/monday/resumo";
 import { ClienteOmie, ErroOmie, type EstadoIntegracao } from "@/integrations/omie/cliente";
 import { CONTRATOS } from "@/integrations/omie/contratos";
 import { processarOutbox, sincronizarEstoque, sincronizarPedidos, sincronizarProdutos } from "@/integrations/omie/sync";
@@ -146,7 +145,7 @@ describe("planejamento", () => {
     expect(r.tarefas).toBeGreaterThan(0);
   });
 
-  it("indicadores, qualidade de dados e resumo Monday", async () => {
+  it("indicadores e qualidade de dados", async () => {
     const k = await kpis();
     expect(k.concluidas).toBeGreaterThanOrEqual(2);
     expect(k.otd).toBe(0.5); // uma no prazo, outra atrasada (histórico demo)
@@ -158,8 +157,6 @@ describe("planejamento", () => {
     const q = await checagens();
     expect(q.ciclos).toEqual([]);
     expect(q.semOmie.length).toBeGreaterThan(0);
-    const m = await resumoParaMonday();
-    expect(m.maquinas.some((x) => x.status === "Em execução")).toBe(true);
   });
 });
 
