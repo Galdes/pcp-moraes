@@ -1,0 +1,38 @@
+name: Agendador Omie
+# Chama o PCP em produção para sincronizar com o Omie (a cada 10 min) e
+# recalcular a programação (a cada 30 min). Substitui o container "cron" do
+# docker-compose, que não existe na Vercel (o Cron da Vercel no plano Hobby só roda 1x/dia).
+#
+# Configure em Settings > Secrets and variables > Actions:
+#   secret   CRON_SECRET = o mesmo valor da variável CRON_SECRET na Vercel (16+ caracteres)
+#   variable PCP_URL     = https://pcp-moraes.vercel.app (opcional; esse é o padrão)
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: agendador-omie
+  cancel-in-progress: false
+jobs:
+  sincronizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      PCP_URL: ${{ vars.PCP_URL || 'https://pcp-moraes.vercel.app' }}
+      CRON_SECRET: ${{ secrets.CRON_SECRET }}
+    steps:
+      - name: Sincronizar Omie
+        run: |
+          test -n "$CRON_SECRET" || { echo "::error::Secret CRON_SECRET não configurado"; exit 1; }
+          curl -sS --fail-with-body --max-time 90 -X POST -H "Authorization: Bearer $CRON_SECRET" "$PCP_URL/api/cron/omie"
+      - name: Recalcular programação (a cada 30 min)
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '*/10 * * * *'
+        run: |
+          m=$(date -u +%M)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ $((10#$m % 30)) -lt 10 ]; then
+            curl -sS --fail-with-body --max-time 90 -X POST -H "Authorization: Bearer $CRON_SECRET" "$PCP_URL/api/cron/programacao"
+          else
+            echo "fora da janela de 30 min"
+          fi
