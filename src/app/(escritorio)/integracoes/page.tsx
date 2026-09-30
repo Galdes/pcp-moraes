@@ -9,6 +9,7 @@ import { fmtDataHora } from "@/lib/formato";
 import { ativarOmieAction, conectarOmieAction, desativarOmieAction, desconectarOmieAction, modoOmieAction, outboxAction, sincronizarAction, testarOmieAction, validadosOmieAction } from "./actions";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 60; // vale também para o botão "Sincronizar tudo agora"
 export const metadata = { title: "Integrações" };
 
 const ENTIDADES: [string, string, string][] = [
