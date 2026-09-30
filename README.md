@@ -14,7 +14,7 @@ Ele cobre o que o Omie não tem na produção: roteiro, centros de trabalho, pro
 | **Posto (tablet)** | Operador entra com matrícula + PIN, lê o QR da ficha, inicia, para (com motivo), retoma e conclui (boas e refugo). Funciona com Wi-Fi instável: fila local com reenvio e chave de idempotência. |
 | **Indicadores** | OTD, aderência ao programa, lead time da máquina, WIP, OPs em risco, Pareto de paradas, faltas de material, **OEE do gargalo** e utilização. |
 | **MRP** | Baldes semanais, estrutura multinível com peças "fantasma", supermercado por mín/máx, lote mínimo/múltiplo, lead time. Gera sugestões de OP e **requisição de compra no Omie**. |
-| **Integrações** | Omie (leitura e escrita com limites, disjuntor e fila de envio) e resumo por máquina para o **Monday** via N8N. |
+| **Integrações** | Omie (leitura e escrita com limites, disjuntor e fila de envio). |
 
 Veja também [docs/ARQUITETURA.md](docs/ARQUITETURA.md) (decisões, modelo de dados e regras de negócio) e [docs/IMPLANTACAO.md](docs/IMPLANTACAO.md) (roteiro de implantação na fábrica).
 
@@ -25,7 +25,7 @@ Veja também [docs/ARQUITETURA.md](docs/ARQUITETURA.md) (decisões, modelo de da
 ### Opção A · Docker (recomendado)
 
 ```bash
-cp .env.example .env          # ajuste CRON_SECRET, EXPORT_TOKEN, TV_TOKEN e DB_SENHA
+cp .env.example .env          # ajuste CRON_SECRET, CHAVE_CONFIG, TV_TOKEN e DB_SENHA
 docker compose up -d --build  # banco + sistema + agendador
 docker compose exec app npx tsx scripts/seed.ts          # setores, motivos e usuários
 # opcional, dados de demonstração (Vibro 810, pedidos, histórico):
@@ -82,10 +82,6 @@ Proteções embutidas: limite por método por minuto (padrão 200; Omie permite 
 
 Itens novos vindos do Omie entram marcados "revisar" (tipo, origem e política são deduzidos). A tela Qualidade dos dados lista o que falta.
 
-## Monday (visão executiva)
-
-O chão de fábrica deixa de ser controlado no Monday. O N8N lê `GET /api/export/monday` (cabeçalho `Authorization: Bearer EXPORT_TOKEN`) e atualiza **um item por máquina** no quadro executivo: status (Planejando, Programado, Em execução, Em atraso, Concluído), % concluído em horas-padrão, data prometida, fim previsto e dias de atraso.
-
 ## TV do chão de fábrica
 
 Abra `https://SEU-ENDERECO/tv?token=TV_TOKEN` no navegador da TV. O token só dá acesso de leitura a essa tela.
@@ -103,7 +99,7 @@ db/migrations/        esquema SQL versionado
 scripts/              migrate, seed (base e --demo)
 src/domain/           regras puras, sem banco (explosão, MRP, kitting, programação, OEE)
 src/server/           serviços com banco (OPs, posto, programação, MRP, indicadores, auth)
-src/integrations/     omie/ (cliente, contratos, mapeamento, sync) e monday/
+src/integrations/     omie/ (cliente, contratos, mapeamento, sync)
 src/app/              telas (Next.js App Router) e rotas de API
 tests/                testes de domínio e de integração (PostgreSQL real)
 tests/e2e/            roteiros Playwright (posto, offline, escritório, capturas)
