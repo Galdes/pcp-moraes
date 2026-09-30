@@ -19,7 +19,6 @@ O software é a parte menor. O que faz o PCP funcionar é dado confiável e roti
 - Após 2 a 3 semanas: confirmar o gargalo com dados e recalibrar os tempos padrão.
 
 ## Fatia 3 · Programação, Kanban e rituais (3 a 4 semanas)
-- Rodar em paralelo com o quadro do Monday por 2 semanas; depois desligar os subitens do Monday e ligar o resumo executivo via N8N.
 - **Daily de produção** (15 min, em frente à TV): o que parou ontem, o que trava hoje, quem resolve.
 - **Reunião semanal de PCP** (sexta): carga x capacidade das próximas 4 semanas, OPs em risco, aprovação do programa pela diretoria.
 
