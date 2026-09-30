@@ -300,14 +300,21 @@ describe("cliente Omie", () => {
           pedido_venda_produto: [
             { cabecalho: { codigo_pedido: 555010, numero_pedido: "9001", data_previsao: "10/12/2026", etapa: "20" }, det: [{ produto: { codigo_produto: 900001, quantidade: 1 } }] },
             { cabecalho: { codigo_pedido: 555020, numero_pedido: "9002", data_previsao: "11/12/2026", etapa: "20" }, det: [{ produto: { codigo_produto: 900001, quantidade: 2 } }] },
+            { cabecalho: { codigo_pedido: 555030, numero_pedido: "9003", data_previsao: "12/12/2026", etapa: "20" }, det: [{ produto: { codigo_produto: 900001, quantidade: 1 } }] },
+            { cabecalho: { codigo_pedido: 555031, numero_pedido: "9003", data_previsao: "13/12/2026", etapa: "20" }, det: [{ produto: { codigo_produto: 900001, quantidade: 1 } }] },
           ],
         }),
     });
-    expect(await sincronizarPedidos(c)).toBe("2 pedidos");
+    expect(await sincronizarPedidos(c)).toBe("4 pedidos");
     const [manual] = await sql`select omie_id, data_entrega from pedidos_venda where numero = '9001'`;
     expect(manual).toMatchObject({ omie_id: 555010, data_entrega: "2026-12-10" }); // o digitado passa a ser o do Omie
     const [repetido] = await sql`select numero from pedidos_venda where omie_id = 555020`;
     expect(repetido.numero).toBe("9002 (Omie 555020)");
+    const mesmaPagina = await sql`select numero from pedidos_venda where omie_id in (555030, 555031) order by omie_id`;
+    expect(mesmaPagina.map((r) => r.numero)).toEqual(["9003", "9003 (Omie 555031)"]); // repetido dentro da mesma página
+    expect(await sincronizarPedidos(c)).toBe("4 pedidos"); // rodar de novo não duplica nem quebra
+    const [{ total }] = await sql`select count(*)::int as total from pedidos_venda where omie_id between 555000 and 555999`;
+    expect(total).toBe(5);
     const [{ n }] = await sql`select count(*)::int as n from pedido_itens where item_id = ${vibro} and pedido_id in (select id from pedidos_venda where omie_id in (555010, 555020))`;
     expect(n).toBe(2);
   });

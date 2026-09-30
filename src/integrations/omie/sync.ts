@@ -197,17 +197,21 @@ export async function sincronizarEstrutura(c: ClienteOmie, prazo: Prazo = SEM_PR
     await sql.begin(async (tx) => {
       const t = tx as unknown as Sql;
       await t`delete from estrutura where pai_id = ${pai.id} and fonte = 'omie'`;
+      const porFilho = new Map<number, { pai_id: number; filho_id: number; quantidade: number; perda_pct: number; fonte: string }>();
       for (const l of est) {
         const filho = porOmie.get(l.filho_omie_id);
         if (!filho) {
           avisos.push(`${pai.codigo}: componente Omie ${l.filho_codigo || l.filho_omie_id} não importado`);
           continue;
         }
-        await t`insert into estrutura (pai_id, filho_id, quantidade, perda_pct, fonte)
-                values (${pai.id}, ${filho}, ${l.quantidade}, ${l.perda_pct}, 'omie')
+        porFilho.set(filho, { pai_id: pai.id, filho_id: filho, quantidade: l.quantidade, perda_pct: l.perda_pct, fonte: "omie" });
+      }
+      const ls = [...porFilho.values()];
+      if (ls.length) {
+        await t`insert into estrutura ${t(ls as never, "pai_id", "filho_id", "quantidade", "perda_pct", "fonte")}
                 on conflict (pai_id, filho_id) do update set quantidade = excluded.quantidade, perda_pct = excluded.perda_pct,
                   fonte = 'omie', updated_at = now()`;
-        linhas++;
+        linhas += ls.length;
       }
     });
   }
@@ -269,32 +273,58 @@ export async function sincronizarPedidos(c: ClienteOmie, prazo: Prazo = SEM_PRAZ
     extrairListaPedidos,
     cur.pagina,
   )) {
+    // grava a página inteira em poucos comandos (antes: ~6 idas ao banco por pedido,
+    // o que estourava o limite de 60 s da Vercel)
+    const porOmie = new Map<number, NonNullable<ReturnType<typeof mapearPedido>>>();
     for (const b of pg.registros) {
       const p = mapearPedido(b);
-      if (!p || !p.data_entrega) continue;
-      const status = p.cancelado ? "cancelado" : faturado.includes(p.etapa) ? "atendido" : "aberto";
+      if (p && p.data_entrega) porOmie.set(p.omie_id, p);
+    }
+    const peds = [...porOmie.values()];
+    if (peds.length) {
       await sql.begin(async (tx) => {
         const t = tx as unknown as Sql;
-        // pedido digitado à mão no PCP com o mesmo número: passa a ser este pedido do Omie
-        await t`update pedidos_venda set omie_id = ${p.omie_id}, updated_at = now()
-                where numero = ${p.numero} and omie_id is null
-                  and not exists (select 1 from pedidos_venda where omie_id = ${p.omie_id})`;
+        const numeros = peds.map((p) => p.numero);
+        const omieIds = peds.map((p) => p.omie_id);
+        // pedido digitado à mão no PCP com o mesmo número: passa a ser o pedido do Omie
+        await t`update pedidos_venda pv set omie_id = x.omie_id, updated_at = now()
+                from (select distinct on (numero) numero, omie_id from unnest(${numeros}::text[], ${omieIds}::bigint[]) as u(numero, omie_id)
+                      where not exists (select 1 from pedidos_venda q where q.omie_id = u.omie_id)) x
+                where pv.numero = x.numero and pv.omie_id is null`;
         // número repetido em outro pedido do Omie: grava com o código do Omie para não colidir
-        const [outro] = await t`select 1 from pedidos_venda where numero = ${p.numero} and omie_id <> ${p.omie_id}`;
-        const numero = outro ? `${p.numero} (Omie ${p.omie_id})` : p.numero;
-        const [ped] = await t`
-          insert into pedidos_venda (numero, cliente, data_emissao, data_entrega, status, omie_id)
-          values (${numero}, ${p.cliente}, ${p.data_emissao ?? p.data_entrega}, ${p.data_entrega}, ${status}, ${p.omie_id})
+        const dono = new Map<string, number | null>(
+          (await t`select numero, omie_id from pedidos_venda where numero = any(${numeros}::text[])`).map((r) => [r.numero as string, r.omie_id === null ? null : Number(r.omie_id)]),
+        );
+        const linhas = peds.map((p) => {
+          const d = dono.get(p.numero);
+          const numero = d !== undefined && d !== p.omie_id ? `${p.numero} (Omie ${p.omie_id})` : p.numero;
+          if (d === undefined) dono.set(p.numero, p.omie_id);
+          const status = p.cancelado ? "cancelado" : faturado.includes(p.etapa) ? "atendido" : "aberto";
+          return { numero, cliente: p.cliente, data_emissao: p.data_emissao ?? p.data_entrega, data_entrega: p.data_entrega, status, omie_id: p.omie_id };
+        });
+        const ids = await t`
+          insert into pedidos_venda ${t(linhas as never, "numero", "cliente", "data_emissao", "data_entrega", "status", "omie_id")}
           on conflict (omie_id) do update set cliente = excluded.cliente, data_entrega = excluded.data_entrega,
             status = excluded.status, updated_at = now()
-          returning id`;
-        for (const i of agregarItensPedido(p.itens)) {
+          returning id, omie_id`;
+        const idPorOmie = new Map(ids.map((r) => [Number(r.omie_id), r.id as number]));
+        const pedIds: number[] = [], prodIds: number[] = [], qtds: number[] = [];
+        for (const p of peds) {
+          for (const i of agregarItensPedido(p.itens)) {
+            pedIds.push(idPorOmie.get(p.omie_id)!);
+            prodIds.push(i.produto_omie_id);
+            qtds.push(i.quantidade);
+          }
+        }
+        if (pedIds.length) {
           await t`insert into pedido_itens (pedido_id, item_id, quantidade)
-                  select ${ped.id}, id, ${i.quantidade} from itens where omie_id = ${i.produto_omie_id}
+                  select x.pedido_id, it.id, x.qtd
+                  from unnest(${pedIds}::int[], ${prodIds}::bigint[], ${qtds}::numeric[]) as x(pedido_id, produto_omie_id, qtd)
+                  join itens it on it.omie_id = x.produto_omie_id
                   on conflict (pedido_id, item_id) do update set quantidade = excluded.quantidade`;
         }
       });
-      n++;
+      n += peds.length;
     }
     if (pg.ultima) break;
     if (esgotado(prazo)) {
@@ -316,10 +346,15 @@ export async function sincronizarCompras(c: ClienteOmie) {
   await sql.begin(async (tx) => {
     const t = tx as unknown as Sql;
     await t`update recebimentos_programados set status = 'recebido' where omie_ref is not null and status = 'aberto'`;
-    for (const r of recs) {
+    // um comando só (antes: um insert por item de compra)
+    const unicos = [...new Map(recs.map((r) => [r.referencia, r])).values()];
+    if (unicos.length) {
       await t`insert into recebimentos_programados (item_id, quantidade, data_prevista, documento, status, omie_ref)
-              select id, ${r.quantidade_pendente}, ${r.data_prevista ?? hojeNoFuso()}, ${r.documento}, 'aberto', ${r.referencia}
-              from itens where omie_id = ${r.produto_omie_id}
+              select it.id, x.qtd, x.data_prevista::date, x.documento, 'aberto', x.ref
+              from unnest(${unicos.map((r) => r.produto_omie_id)}::bigint[], ${unicos.map((r) => r.quantidade_pendente)}::numeric[],
+                          ${unicos.map((r) => r.data_prevista ?? hojeNoFuso())}::text[], ${unicos.map((r) => r.documento)}::text[],
+                          ${unicos.map((r) => r.referencia)}::text[]) as x(produto_omie_id, qtd, data_prevista, documento, ref)
+              join itens it on it.omie_id = x.produto_omie_id
               on conflict (omie_ref) do update set quantidade = excluded.quantidade, data_prevista = excluded.data_prevista, status = 'aberto'`;
     }
   });

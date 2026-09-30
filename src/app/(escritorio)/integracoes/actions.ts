@@ -14,7 +14,8 @@ export async function sincronizarAction(f: FormData) {
     const ent = texto(f, "entidade");
     // ~35 s de trabalho: sobra tempo para reprogramar dentro do limite de 60 s da Vercel;
     // o que não terminar continua sozinho nas próximas execuções do agendador
-    const r = await executarSincronizacao({ forcar: ent ? [ent] : ["produtos", "estoque", "pedidos", "compras", "outbox", "estrutura"], orcamentoMs: 35_000 });
+    // "tudo agora" roda o que está vencido ou em andamento (não reinicia o que acabou de concluir)
+    const r = await executarSincronizacao({ forcar: ent ? [ent] : undefined, orcamentoMs: 35_000 });
     if (r.some((x) => x.ok)) await reprogramar();
     return r.map((x) => `${x.entidade}: ${x.ok ? "ok" : "erro"} (${x.mensagem})`).join(" · ");
   });
