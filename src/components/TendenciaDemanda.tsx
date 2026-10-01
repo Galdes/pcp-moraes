@@ -51,15 +51,25 @@ export async function TendenciaDemanda({ filtro = '', preservar = {} }: { filtro
   const acoes = <Link href="/integracoes#demanda" className="btn-sec btn-xs">Origem dos dados</Link>;
   if (!dados.disponivel) return <Card titulo={titulo} className="mt-4" acoes={acoes}><Vazio>Histórico de demanda ainda não preparado. Solicite a atualização da base do sistema.</Vazio></Card>;
   const linhas = dados.linhas as unknown as LinhaAnalitica[];
+  // Só itens com venda de verdade: pendentes (veículos, sucata, cavaco...) ficam fora da lista.
   const itens = new Map<number, string>();
+  const vendido = new Map<number, { quantidade: number; fabricado: boolean }>();
   const familias = new Set<string>();
   for (const l of linhas) {
-    if (l.produto_omie_id && ['venda','pendente','devolucao'].includes(l.natureza)) itens.set(l.produto_omie_id, `${l.codigo} · ${l.descricao}`);
+    if (l.produto_omie_id && l.natureza === 'venda') {
+      itens.set(l.produto_omie_id, `${l.codigo} · ${l.descricao}`);
+      const v = vendido.get(l.produto_omie_id) ?? { quantidade: 0, fabricado: false };
+      v.quantidade += Number(l.quantidade);
+      v.fabricado ||= l.origem_item === 'fabricado';
+      vendido.set(l.produto_omie_id, v);
+    }
     if (l.familia_demanda?.trim() && l.revisar === false) familias.add(l.familia_demanda);
   }
   const opcoes = [...itens].sort((a,b) => a[1].localeCompare(b[1], 'pt-BR'));
+  // Padrão: o item fabricado mais vendido no período (sem fabricado, o mais vendido).
+  const ranking = [...vendido].sort((a,b) => Number(b[1].fabricado) - Number(a[1].fabricado) || b[1].quantidade - a[1].quantidade || (itens.get(a[0]) ?? '').localeCompare(itens.get(b[0]) ?? '', 'pt-BR'));
   const valido = filtro.startsWith('familia:') ? familias.has(filtro.slice(8)) : itens.has(Number(filtro.replace('item:', '')));
-  const selecionado = valido ? filtro : opcoes.length ? `item:${opcoes[0][0]}` : '';
+  const selecionado = valido ? filtro : ranking.length ? `item:${ranking[0][0]}` : '';
   const r = recortarDemanda(dados, selecionado);
   const ultima = dados.lotes.map(l => new Date(l.concluido_em as Date).getTime()).sort((a,b) => b-a)[0];
   const pendencias = linhas.filter(l => l.natureza === 'pendente').length;
