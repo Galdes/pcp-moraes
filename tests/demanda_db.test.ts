@@ -54,7 +54,7 @@ describe('publicação atômica do histórico fiscal', () => {
     if (!dados.disponivel) throw new Error('esquema ausente');
     expect(dados.lotes).toHaveLength(1);
     expect(recortarDemanda(dados,'item:99').serie[0].quantidade).toBe(10);
-    await sql`update demanda_lotes set concluido_em=now()-interval '2 days'`;
+    await sql`update demanda_lotes set concluido_em=${new Date(Date.now() - 2 * 86_400_000)}`;
     await importarPaginaDemanda({cliente,hoje});
     dados = await lerDemanda();
     expect(dados.disponivel && dados.linhas).toHaveLength(2); // ainda o snapshot anterior
