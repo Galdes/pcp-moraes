@@ -1,0 +1,2 @@
+# Cada cliente tem um arquivo em sites/<cliente>.caddy (criado pelo novo-cliente.sh)
+import /etc/caddy/sites/*.caddy
