@@ -66,7 +66,7 @@ Em produção: `npm run build && npm start` atrás de HTTPS (o cookie de sessão
 
 O Omie é o dono de produtos, estruturas, estoque, pedidos de venda e pedidos de compra. O PCP:
 
-- **lê** do Omie: produtos (60 min), estruturas (1x/dia), saldo (10 min), pedidos de venda (10 min) e pedidos de compra (30 min);
+- **lê** do Omie: nomes dos clientes (1x/dia, antes de produtos), produtos (60 min), estruturas (1x/dia), saldo (10 min), pedidos de venda (10 min) e pedidos de compra (30 min);
 - **escreve** no Omie: inclusão da OP ao liberar, conclusão da OP (o Omie faz a movimentação de estoque) e requisição de compra gerada pelo MRP.
 
 Proteções embutidas: limite por método por minuto (padrão 200; Omie permite 240), no máximo 2 chamadas simultâneas, limite diário opcional (plano Fit: 500/dia), disjuntor que pausa a integração por 10 min depois de 3 erros seguidos (antes do bloqueio de 30 min do Omie), uma sincronização por vez e fila de envio idempotente com repetição.
@@ -80,7 +80,13 @@ Proteções embutidas: limite por método por minuto (padrão 200; Omie permite 
 5. Liste os métodos de escrita validados em `OMIE_CONTRATOS_VALIDADOS` (ex.: `ConcluirOrdemProducao,IncluirReq`). Métodos de escrita não validados **nunca** são chamados.
 6. Mude para `OMIE_MODO=ativo`. O agendador chama `POST /api/cron/omie` com `Authorization: Bearer CRON_SECRET`.
 
-**Na Vercel (plano Hobby):** não há o container `cron` do docker-compose e o Cron da Vercel só roda 1x/dia. O agendamento fica no GitHub Actions (`.github/workflows/agendador-omie.yml`, a cada 10 min). Configure o secret `CRON_SECRET` no repositório com o mesmo valor da variável `CRON_SECRET` da Vercel. Cada execução trabalha ~45 s (limite de 60 s da Vercel); o que não terminar (estruturas, carga inicial de produtos) continua na próxima, a partir de onde parou.
+**Na Vercel (plano Hobby):** não há o container `cron` do docker-compose e o Cron da Vercel só roda 1x/dia. O agendamento fica no GitHub Actions (`.github/workflows/agendador-omie.yml`, a cada 10 min). Configure o secret `CRON_SECRET` no repositório (Settings → Secrets and variables → Actions → New repository secret) com o mesmo valor da variável `CRON_SECRET` da Vercel; sem ele, toda execução do agendador falha com "Secret CRON_SECRET não configurado" e nada é sincronizado. Cada execução trabalha ~45 s (limite de 60 s da Vercel); o que não terminar (estruturas, carga inicial de produtos) continua na próxima, a partir de onde parou.
+
+**Como cada leitura economiza chamadas:**
+
+- **Produtos e pedidos de venda — leitura incremental.** Uma varredura completa a cada 24 h; entre uma e outra, o PCP envia `filtrar_por_data_de`/`filtrar_por_data_ate` (dd/mm/aaaa, últimos 2 dias) e lê só o que mudou. A mensagem do resultado começa com "alterados desde dd/mm/aaaa: " quando a leitura foi incremental. O modo fica em `integracao_estado` (entidades `cursor:modo:produtos` e `cursor:modo:pedidos`), sem migração; o filtro vai no cursor, então uma leitura que continua na execução seguinte usa o mesmo filtro. Se o Omie recusar o filtro (erro de tag/parâmetro inválido), o incremental daquela entidade é desligado, o motivo vai para o log e a leitura completa é refeita na mesma execução. Para religar, apague a linha `cursor:modo:<entidade>`. `OMIE_INCREMENTAL=0` desliga o modo incremental.
+- **Estruturas — carteira primeiro.** Uma chamada `ConsultarEstrutura` por item fabricado, 2 em paralelo. A fila começa pelos itens dos pedidos de venda abertos e das OPs ativas (sugerida, firmada, liberada, em processo), descendo pela estrutura já conhecida (acabado → conjunto → peça), e só depois o restante. Quando um item da carteira revela filhos novos, a fila é recalculada. O cursor (`cursor:estrutura`) guarda os ids já lidos no ciclo (`feitos`), então nada é relido no mesmo ciclo; se uma chamada falhar, o progresso é salvo antes do erro. Cursores antigos (`depoisDe`) começam um ciclo novo.
+- **Nomes dos clientes.** `ListarClientesResumido` (1x/dia, em fatias) monta o mapa código → nome em `integracao_estado` (`cursor:clientes:nomes`), sem migração. Ao terminar, troca "Cliente Omie <código>" pelo nome nos pedidos já gravados; os pedidos novos que não trazem o nome do cliente usam o mapa.
 
 Itens novos vindos do Omie entram marcados "revisar" (tipo, origem e política são deduzidos). A tela Qualidade dos dados lista o que falta.
 

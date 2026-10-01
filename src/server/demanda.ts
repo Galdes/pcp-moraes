@@ -101,7 +101,7 @@ export async function lerDemanda() {
 }
 
 export type DadosDemanda = Awaited<ReturnType<typeof lerDemanda>>;
-export type LinhaAnalitica = LinhaNota & { item_id: number | null; familia_demanda: string | null; revisar: boolean | null };
+export type LinhaAnalitica = LinhaNota & { item_id: number | null; familia_demanda: string | null; revisar: boolean | null; origem_item?: string | null };
 
 export function recortarDemanda(dados: Extract<DadosDemanda, { disponivel: true }>, filtro: string) {
   const linhas = dados.linhas as unknown as LinhaAnalitica[];

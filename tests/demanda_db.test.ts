@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { migrar } from '../scripts/migrate';
 import { sql } from '@/lib/db';
 import { importarPaginaDemanda, lerDemanda, recortarDemanda } from '@/server/demanda';
@@ -25,8 +25,13 @@ beforeAll(async () => {
     values ('QA-PECA','Peça de teste','UN','peca','fabricado',99,'Peças de teste')`;
 }, 60000);
 
+afterEach(() => vi.useRealTimers());
+
 describe('publicação atômica do histórico fiscal', () => {
   it('retoma páginas, preserva snapshots completos, reimporta sem duplicar e separa empresas', async () => {
+    // A importação e a leitura precisam usar o mesmo mês, independentemente do dia do CI.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-09-29T12:00:00Z'));
     const hoje = '2026-09-29';
     const nota = (n: number, qtd = 5) => ({
       compl:{nIdNF:n}, ide:{dEmi:'15/10/2024',tpNF:'1',tpAmb:'1',finNFe:'1'},pedido:{opPedido:'11'},
@@ -49,7 +54,7 @@ describe('publicação atômica do histórico fiscal', () => {
     if (!dados.disponivel) throw new Error('esquema ausente');
     expect(dados.lotes).toHaveLength(1);
     expect(recortarDemanda(dados,'item:99').serie[0].quantidade).toBe(10);
-    await sql`update demanda_lotes set concluido_em=now()-interval '2 days'`;
+    await sql`update demanda_lotes set concluido_em=${new Date(Date.now() - 2 * 86_400_000)}`;
     await importarPaginaDemanda({cliente,hoje});
     dados = await lerDemanda();
     expect(dados.disponivel && dados.linhas).toHaveLength(2); // ainda o snapshot anterior

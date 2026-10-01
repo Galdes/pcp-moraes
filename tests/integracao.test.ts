@@ -18,8 +18,17 @@ import { kpis, paretoParadas, oeePorSetor } from "@/server/indicadores";
 import { checagens } from "@/server/qualidade";
 import { ClienteOmie, ErroOmie, type EstadoIntegracao } from "@/integrations/omie/cliente";
 import { CONTRATOS } from "@/integrations/omie/contratos";
-import { executarSincronizacao, processarOutbox, sincronizarEstoque, sincronizarPedidos, sincronizarProdutos, SincronizacaoParcial } from "@/integrations/omie/sync";
-import { hojeNoFuso, somarDias } from "@/domain/datas";
+import {
+  executarSincronizacao,
+  processarOutbox,
+  sincronizarClientes,
+  sincronizarEstoque,
+  sincronizarEstrutura,
+  sincronizarPedidos,
+  sincronizarProdutos,
+  SincronizacaoParcial,
+} from "@/integrations/omie/sync";
+import { formatarOmie, hojeNoFuso, somarDias } from "@/domain/datas";
 
 let admin: number;
 let item: (c: string) => Promise<number>;
@@ -166,6 +175,9 @@ const memoria = () => {
   return { ler: async () => e, atualizar: async (f: (x: EstadoIntegracao) => EstadoIntegracao) => void (e = f(e)), get: () => e };
 };
 const resposta = (corpo: unknown, status = 200) => new Response(JSON.stringify(corpo), { status });
+/** Volta produtos e pedidos para a leitura completa (apaga o modo incremental salvo). */
+const limparModo = () => sql`delete from integracao_estado where entidade like 'cursor:modo:%'`;
+const INCREMENTAL = /^alterados desde \d{2}\/\d{2}\/\d{4}: /;
 
 describe("cliente Omie", () => {
   it("respeita o limite por minuto", async () => {
@@ -241,6 +253,7 @@ describe("cliente Omie", () => {
       estado: memoria(),
       fetchFn: async (_u, init) => resposta(respostas[JSON.parse(String(init!.body)).call as string]),
     });
+    await limparModo();
     expect(await sincronizarProdutos(c)).toBe("1 novos, 2 atualizados");
     const [novo] = await sql`select tipo, origem, revisar from itens where codigo = '01.10.10.099'`;
     expect(novo).toMatchObject({ tipo: "conjunto", origem: "fabricado", revisar: true });
@@ -275,6 +288,7 @@ describe("cliente Omie", () => {
       },
     });
     const vencido = { ate: Date.now() - 1 }; // prazo já esgotado: faz uma página e para
+    await limparModo();
     await expect(sincronizarProdutos(c, vencido)).rejects.toBeInstanceOf(SincronizacaoParcial);
     await expect(sincronizarProdutos(c, vencido)).rejects.toBeInstanceOf(SincronizacaoParcial);
     expect(await sincronizarProdutos(c)).toBe("3 novos, 0 atualizados"); // total acumulado entre execuções
@@ -305,6 +319,7 @@ describe("cliente Omie", () => {
           ],
         }),
     });
+    await limparModo();
     expect(await sincronizarPedidos(c)).toBe("4 pedidos");
     const [manual] = await sql`select omie_id, data_entrega from pedidos_venda where numero = '9001'`;
     expect(manual).toMatchObject({ omie_id: 555010, data_entrega: "2026-12-10" }); // o digitado passa a ser o do Omie
@@ -312,7 +327,7 @@ describe("cliente Omie", () => {
     expect(repetido.numero).toBe("9002 (Omie 555020)");
     const mesmaPagina = await sql`select numero from pedidos_venda where omie_id in (555030, 555031) order by omie_id`;
     expect(mesmaPagina.map((r) => r.numero)).toEqual(["9003", "9003 (Omie 555031)"]); // repetido dentro da mesma página
-    expect(await sincronizarPedidos(c)).toBe("4 pedidos"); // rodar de novo não duplica nem quebra
+    expect(await sincronizarPedidos(c)).toMatch(/4 pedidos$/); // rodar de novo (agora incremental) não duplica nem quebra
     const [{ total }] = await sql`select count(*)::int as total from pedidos_venda where omie_id between 555000 and 555999`;
     expect(total).toBe(5);
     const [{ n }] = await sql`select count(*)::int as n from pedido_itens where item_id = ${vibro} and pedido_id in (select id from pedidos_venda where omie_id in (555010, 555020))`;
@@ -359,5 +374,231 @@ describe("cliente Omie", () => {
     expect(r).toMatch(/enviados/);
     const [op] = await sql`select omie_id from ordens_producao where omie_id = 123456`;
     expect(op).toBeTruthy();
+  });
+});
+
+describe("leitura incremental de produtos", () => {
+  const hoje = hojeNoFuso();
+  const desde = formatarOmie(somarDias(hoje, -2));
+  const produtos = { pagina: 1, total_de_paginas: 1, produto_servico_cadastro: [{ codigo_produto: 930001, codigo: "INC-1", descricao: "PECA INCREMENTAL", unidade: "UN" }] };
+
+  it("a primeira leitura é completa; a segunda envia o filtro dos últimos 2 dias", async () => {
+    const params: Record<string, unknown>[] = [];
+    const c = new ClienteOmie({
+      appKey: "k",
+      appSecret: "s",
+      estado: memoria(),
+      fetchFn: async (_u, init) => {
+        params.push(JSON.parse(String(init!.body)).param[0]);
+        return resposta(produtos);
+      },
+    });
+    await limparModo();
+    expect(await sincronizarProdutos(c)).not.toMatch(INCREMENTAL);
+    expect(params[0]).not.toHaveProperty("filtrar_por_data_de");
+    const segunda = await sincronizarProdutos(c);
+    expect(segunda).toBe(`alterados desde ${desde}: 0 novos, 1 atualizados`);
+    expect(params[1]).toMatchObject({ filtrar_por_data_de: desde, filtrar_por_data_ate: formatarOmie(hoje) });
+    expect(String(params[1].filtrar_por_data_de)).toMatch(/^\d{2}\/\d{2}\/\d{4}$/);
+  });
+
+  it("depois de 24 h volta a fazer a leitura completa; OMIE_INCREMENTAL=0 desliga", async () => {
+    const params: Record<string, unknown>[] = [];
+    const c = new ClienteOmie({
+      appKey: "k",
+      appSecret: "s",
+      estado: memoria(),
+      fetchFn: async (_u, init) => {
+        params.push(JSON.parse(String(init!.body)).param[0]);
+        return resposta(produtos);
+      },
+    });
+    await sql`update integracao_estado set mensagem = ${JSON.stringify({ ultimaCompleta: new Date(Date.now() - 25 * 3600_000).toISOString() })}
+              where entidade = 'cursor:modo:produtos'`;
+    expect(await sincronizarProdutos(c)).not.toMatch(INCREMENTAL);
+    expect(params[0]).not.toHaveProperty("filtrar_por_data_de");
+    process.env.OMIE_INCREMENTAL = "0";
+    try {
+      expect(await sincronizarProdutos(c)).not.toMatch(INCREMENTAL);
+      expect(params[1]).not.toHaveProperty("filtrar_por_data_de");
+    } finally {
+      delete process.env.OMIE_INCREMENTAL;
+    }
+    expect(await sincronizarProdutos(c)).toMatch(INCREMENTAL);
+  });
+
+  it("se o Omie recusar o filtro, cai para a leitura completa na mesma execução e fica desligado", async () => {
+    const params: Record<string, unknown>[] = [];
+    const c = new ClienteOmie({
+      appKey: "k",
+      appSecret: "s",
+      estado: memoria(),
+      fetchFn: async (_u, init) => {
+        const p = JSON.parse(String(init!.body)).param[0];
+        params.push(p);
+        if (p.filtrar_por_data_de) return resposta({ faultstring: "ERROR: Tag [FILTRAR_POR_DATA_DE] não faz parte da estrutura do tipo [prdListarRequest]!", faultcode: "SOAP-ENV:Client-8" }, 500);
+        return resposta(produtos);
+      },
+    });
+    await limparModo();
+    await sincronizarProdutos(c); // completa
+    expect(await sincronizarProdutos(c)).toBe("0 novos, 1 atualizados"); // tentou incremental, foi recusado, refez completa
+    expect(params.map((p) => !!p.filtrar_por_data_de)).toEqual([false, true, false]);
+    const [modo] = await sql`select mensagem from integracao_estado where entidade = 'cursor:modo:produtos'`;
+    expect(JSON.parse(modo.mensagem as string)).toMatchObject({ desligado: true });
+    const [aviso] = await sql`select status, mensagem from integracao_log where entidade = 'produtos' order by id desc limit 1`;
+    expect(aviso).toMatchObject({ status: "erro" });
+    expect(aviso.mensagem).toMatch(/incremental desligada/);
+    expect(await sincronizarProdutos(c)).not.toMatch(INCREMENTAL); // continua desligado
+    expect(params).toHaveLength(4);
+    expect(params[3]).not.toHaveProperty("filtrar_por_data_de");
+    await limparModo();
+  });
+});
+
+describe("nomes dos clientes", () => {
+  it("o nome substitui o código nos pedidos antigos e nos novos", async () => {
+    const [antes] = await sql`select cliente from pedidos_venda where omie_id = 777`;
+    expect(antes.cliente).toBe("Cliente Omie 55");
+    const chamadas: { call: string; param: Record<string, unknown> }[] = [];
+    const c = new ClienteOmie({
+      appKey: "k",
+      appSecret: "s",
+      estado: memoria(),
+      fetchFn: async (_u, init) => {
+        const b = JSON.parse(String(init!.body));
+        chamadas.push({ call: b.call, param: b.param[0] });
+        if (b.call === "ListarClientesResumido") {
+          return resposta({
+            pagina: b.param[0].pagina,
+            total_de_paginas: 2,
+            clientes_cadastro_resumido:
+              b.param[0].pagina === 1
+                ? [{ codigo_cliente: 55, nome_fantasia: "Fazenda Boa Vista", razao_social: "Boa Vista Agro Ltda" }]
+                : [{ codigo_cliente: 56, nome_fantasia: "", razao_social: "Usina Santa Rita S/A" }],
+          });
+        }
+        return resposta({
+          pagina: 1,
+          total_de_paginas: 1,
+          pedido_venda_produto: [
+            { cabecalho: { codigo_pedido: 778, numero_pedido: "4513", data_previsao: "15/12/2026", etapa: "20", codigo_cliente: 56 }, det: [{ produto: { codigo_produto: 900001, quantidade: 1 } }] },
+          ],
+        });
+      },
+    });
+    await expect(sincronizarClientes(c, { ate: Date.now() - 1 })).rejects.toBeInstanceOf(SincronizacaoParcial); // em fatias
+    expect(await sincronizarClientes(c)).toBe("2 clientes; 1 pedidos com o nome do cliente");
+    expect(chamadas.filter((x) => x.call === "ListarClientesResumido").map((x) => x.param)).toEqual([
+      { pagina: 1, registros_por_pagina: 100, apenas_importado_api: "N" },
+      { pagina: 2, registros_por_pagina: 100, apenas_importado_api: "N" },
+    ]);
+    const [antigo] = await sql`select cliente from pedidos_venda where omie_id = 777`;
+    expect(antigo.cliente).toBe("Fazenda Boa Vista");
+    await sincronizarPedidos(c);
+    const [novo] = await sql`select cliente from pedidos_venda where omie_id = 778`;
+    expect(novo.cliente).toBe("Usina Santa Rita S/A");
+  });
+
+  it("a tarefa clientes roda antes de produtos", async () => {
+    const ordem: string[] = [];
+    const c = new ClienteOmie({
+      appKey: "k",
+      appSecret: "s",
+      estado: memoria(),
+      fetchFn: async (_u, init) => {
+        ordem.push(JSON.parse(String(init!.body)).call);
+        return resposta({});
+      },
+    });
+    await executarSincronizacao({ forcar: ["produtos", "clientes"], cliente: c });
+    expect(ordem).toEqual(["ListarClientesResumido", "ListarProdutos"]);
+  });
+});
+
+describe("estruturas: carteira primeiro, em paralelo e retomável", () => {
+  // A (acabado, na carteira) → B (conjunto) → C (peça), estrutura já conhecida.
+  // No Omie, A também tem N (filho novo, que ainda não estava na estrutura). X1 e X2 não estão na carteira.
+  const OMIE = { A: 940001, B: 940002, C: 940003, X1: 940011, X2: 940012, N: 940013 } as const;
+  const nomes = Object.fromEntries(Object.entries(OMIE).map(([k, v]) => [v, k])) as Record<number, string>;
+  const malha: Record<number, number[]> = { [OMIE.A]: [OMIE.B, OMIE.N], [OMIE.B]: [OMIE.C] };
+  const ids: Record<string, number> = {};
+
+  const cliente = (opcoes: { atraso?: number; falharEm?: string; registro?: string[]; simultaneas?: { agora: number; max: number } } = {}) =>
+    new ClienteOmie({
+      appKey: "k",
+      appSecret: "s",
+      estado: memoria(),
+      fetchFn: async (_u, init) => {
+        const id = JSON.parse(String(init!.body)).param[0].idProduto as number;
+        opcoes.registro?.push(nomes[id]);
+        const s = opcoes.simultaneas;
+        if (s) s.max = Math.max(s.max, ++s.agora);
+        await new Promise((r) => setTimeout(r, opcoes.atraso ?? 0));
+        if (s) s.agora--;
+        if (opcoes.falharEm === nomes[id]) return resposta({ faultstring: "ERROR: falha temporária no Omie", faultcode: "SOAP-ENV:Server" }, 500);
+        return resposta({ ident: { idProduto: id }, itens: (malha[id] ?? []).map((f) => ({ idProdMalha: f, codProdMalha: `EST-${nomes[f]}`, quantProdMalha: 1 })) });
+      },
+    });
+
+  beforeAll(async () => {
+    // só os itens deste teste entram na fila
+    await sql`update itens set ativo = false where origem = 'fabricado' and omie_id is not null`;
+    for (const k of ["A", "B", "C", "X1", "X2", "N"] as const) {
+      const tipo = k === "A" ? "produto" : k === "B" ? "conjunto" : "peca";
+      const [r] = await sql`insert into itens (codigo, descricao, unidade, tipo, origem, omie_id)
+                            values (${`EST-${k}`}, ${`ITEM ${k}`}, 'UN', ${tipo}, 'fabricado', ${OMIE[k]}) returning id`;
+      ids[k] = r.id as number;
+    }
+    await sql`insert into estrutura (pai_id, filho_id, quantidade, fonte) values (${ids.A}, ${ids.B}, 1, 'omie'), (${ids.B}, ${ids.C}, 1, 'omie')`;
+    const [pv] = await sql`insert into pedidos_venda (numero, cliente, data_entrega, status) values ('PV-EST', 'Teste', ${somarDias(hojeNoFuso(), 30)}, 'aberto') returning id`;
+    await sql`insert into pedido_itens (pedido_id, item_id, quantidade) values (${pv.id}, ${ids.A}, 1)`;
+  });
+
+  const limparCursor = () => sql`delete from integracao_estado where entidade = 'cursor:estrutura'`;
+
+  it("lê primeiro o item da carteira, depois os filhos dele e só então o restante, sem reler no ciclo", async () => {
+    await limparCursor();
+    const registro: string[] = [];
+    const simultaneas = { agora: 0, max: 0 };
+    const msg = await sincronizarEstrutura(cliente({ atraso: 15, registro, simultaneas }));
+    expect(msg).toMatch(/^6 estruturas lidas, 3 linhas/);
+    expect(registro[0]).toBe("A"); // item da carteira primeiro
+    const pos = (k: string) => registro.indexOf(k);
+    for (const k of ["B", "C", "N"]) {
+      expect(pos(k)).toBeLessThan(pos("X1")); // filhos (inclusive o novo, N) antes dos demais
+      expect(pos(k)).toBeLessThan(pos("X2"));
+    }
+    expect([...registro].sort()).toEqual(["A", "B", "C", "N", "X1", "X2"]); // nunca relê no mesmo ciclo
+    expect(simultaneas.max).toBe(2); // 2 leituras em paralelo
+    const [cur] = await sql`select mensagem from integracao_estado where entidade = 'cursor:estrutura'`;
+    expect(cur.mensagem).toBeNull();
+  });
+
+  it("retoma de onde parou e salva o progresso antes de lançar um erro", async () => {
+    await limparCursor();
+    const registro: string[] = [];
+    const vencido = { ate: Date.now() - 1 }; // prazo esgotado: uma leitura por execução
+    await expect(sincronizarEstrutura(cliente({ registro }), vencido)).rejects.toBeInstanceOf(SincronizacaoParcial);
+    await expect(sincronizarEstrutura(cliente({ registro }), vencido)).rejects.toThrow(/2 estruturas lidas, faltam 4/);
+    await expect(sincronizarEstrutura(cliente({ registro }), vencido)).rejects.toBeInstanceOf(SincronizacaoParcial);
+    expect(registro).toEqual(["A", "B", "N"]); // carteira (A, B) e o filho novo revelado por A (N)
+    // a próxima execução falha em X1: o que já foi lido (inclusive C, lido em paralelo) fica gravado
+    await expect(sincronizarEstrutura(cliente({ registro, falharEm: "X1" }))).rejects.toThrow(/falha temporária/);
+    const [salvo] = await sql`select mensagem from integracao_estado where entidade = 'cursor:estrutura'`;
+    const cur = JSON.parse(salvo.mensagem as string);
+    expect([...cur.feitos].sort()).toEqual([ids.A, ids.B, ids.C, ids.N].sort());
+    expect(cur.linhas).toBe(3);
+    const antes = registro.length;
+    expect(await sincronizarEstrutura(cliente({ registro }))).toBe("6 estruturas lidas, 3 linhas");
+    expect(registro.slice(antes).sort()).toEqual(["X1", "X2"]); // retoma sem reler o que já foi feito
+  });
+
+  it("aceita o cursor antigo ({ depoisDe }) começando um ciclo novo", async () => {
+    await sql`insert into integracao_estado (entidade, mensagem) values ('cursor:estrutura', ${JSON.stringify({ depoisDe: 999999, lidas: 20, linhas: 7, avisos: 0 })})
+              on conflict (entidade) do update set mensagem = excluded.mensagem`;
+    const registro: string[] = [];
+    expect(await sincronizarEstrutura(cliente({ registro }))).toBe("6 estruturas lidas, 3 linhas");
+    expect([...registro].sort()).toEqual(["A", "B", "C", "N", "X1", "X2"]);
   });
 });
