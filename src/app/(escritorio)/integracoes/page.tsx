@@ -13,10 +13,11 @@ export const maxDuration = 60; // vale também para o botão "Sincronizar tudo a
 export const metadata = { title: "Integrações" };
 
 const ENTIDADES: [string, string, string][] = [
-  ["produtos", "Produtos", "a cada 60 min"],
-  ["estrutura", "Estruturas", "1 vez ao dia"],
+  ["clientes", "Clientes (nomes)", "1 vez ao dia, antes de produtos"],
+  ["produtos", "Produtos", "a cada 60 min · completa 1x/dia; entre elas, só os alterados"],
+  ["estrutura", "Estruturas", "1 vez ao dia · carteira primeiro, 2 em paralelo"],
   ["estoque", "Saldo de estoque", "a cada 10 min"],
-  ["pedidos", "Pedidos de venda", "a cada 10 min"],
+  ["pedidos", "Pedidos de venda", "a cada 10 min · completa 1x/dia; entre elas, só os alterados"],
   ["compras", "Pedidos de compra", "a cada 30 min"],
   ["outbox", "Envios ao Omie (OP, requisição)", "a cada execução"],
 ];
