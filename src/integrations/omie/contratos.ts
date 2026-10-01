@@ -51,6 +51,13 @@ export const CONTRATOS = {
     verificado: true,
     fonte: "cliente público omie_python_api (pagina, registros_por_pagina, apenas_importado_api)",
   },
+  listarClientesResumido: {
+    endpoint: "geral/clientes/",
+    call: "ListarClientesResumido",
+    escrita: false,
+    verificado: false,
+    fonte: "Lista de APIs Omie (geral/clientes/); parâmetros pagina, registros_por_pagina, apenas_importado_api e retorno clientes_cadastro_resumido a confirmar no portal",
+  },
   pesquisarPedidosCompra: {
     endpoint: "produtos/pedidocompra/",
     call: "PesquisarPedCompra",

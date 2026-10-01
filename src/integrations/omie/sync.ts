@@ -8,15 +8,17 @@
 
 import { sql, type Sql } from "@/lib/db";
 import { agregarItensPedido } from "@/domain/tendencia";
-import { hojeNoFuso } from "@/domain/datas";
+import { formatarOmie, hojeNoFuso, somarDias } from "@/domain/datas";
 import { ClienteOmie, ErroOmie, type ArmazemEstado, type EstadoIntegracao } from "./cliente";
 import { CONTRATOS, contratoLiberado, type NomeContrato } from "./contratos";
 import { lerConfigOmie, type ModoOmie } from "./config";
 import {
+  extrairListaClientes,
   extrairListaPedidos,
   extrairListaProdutos,
   extrairPedidosCompra,
   extrairPosicaoEstoque,
+  mapearClienteResumido,
   mapearEstrutura,
   mapearPedido,
   mapearPedidoCompra,
@@ -138,14 +140,90 @@ export function classificarNovo(p: { codigo: string; descricao: string; tipoItem
   return { tipo: "componente_comprado", origem: "comprado" } as const;
 }
 
+// ---------- leitura incremental (produtos e pedidos) ----------
+// Uma varredura completa a cada 24 h; entre uma e outra, só o que mudou nos
+// últimos 2 dias (filtrar_por_data_de/ate). O modo fica em integracao_estado
+// (entidade "cursor:modo:<entidade>"), sem migração de banco.
+// OMIE_INCREMENTAL=0 desliga o modo incremental (sempre leitura completa).
+export interface FiltroData {
+  de: string; // dd/mm/aaaa
+  ate: string; // dd/mm/aaaa
+}
+interface ModoLeitura {
+  ultimaCompleta: string | null; // ISO
+  desligado?: boolean; // o Omie recusou o filtro: só leitura completa
+  motivo?: string;
+}
+const COMPLETA_A_CADA_MS = 24 * 60 * 60_000;
+const DIAS_INCREMENTAL = 2;
+
+async function escolherFiltro(ent: string): Promise<FiltroData | null> {
+  if (process.env.OMIE_INCREMENTAL === "0") return null;
+  const m = await lerCursor<ModoLeitura>(`modo:${ent}`);
+  if (!m?.ultimaCompleta || m.desligado) return null;
+  if (Date.now() - new Date(m.ultimaCompleta).getTime() >= COMPLETA_A_CADA_MS) return null;
+  const hoje = hojeNoFuso();
+  return { de: formatarOmie(somarDias(hoje, -DIAS_INCREMENTAL)), ate: formatarOmie(hoje) };
+}
+
+async function concluirLeitura(ent: string, filtro: FiltroData | null) {
+  if (filtro) return; // só a leitura completa reinicia a contagem das 24 h
+  const m = await lerCursor<ModoLeitura>(`modo:${ent}`);
+  await salvarCursor(`modo:${ent}`, { ...m, ultimaCompleta: new Date().toISOString() });
+}
+
+/** Erro de API que indica que o Omie não aceita a tag/parâmetro do filtro. */
+const filtroRecusado = (e: unknown) =>
+  e instanceof ErroOmie && e.tipo === "api" && /\btag\b|par[aâ]metro|filtrar_por_data/i.test(e.message);
+
+const paramFiltro = (f: FiltroData | null | undefined) => (f ? { filtrar_por_data_de: f.de, filtrar_por_data_ate: f.ate } : {});
+const prefixoFiltro = (f: FiltroData | null) => (f ? `alterados desde ${f.de}: ` : "");
+
+/**
+ * Executa a leitura no modo certo (completa ou incremental). O filtro vai no
+ * cursor, para a retomada entre execuções usar o mesmo filtro. Se o Omie
+ * recusar o filtro, desliga o incremental da entidade e refaz a leitura completa
+ * na mesma execução.
+ */
+async function lerComModo<C extends { pagina: number; filtro?: FiltroData | null }>(
+  ent: string,
+  inicial: Omit<C, "filtro">,
+  ler: (cur: C) => Promise<string>,
+): Promise<string> {
+  const salvo = await lerCursor<C>(ent);
+  // cursor antigo (sem "filtro") continua como leitura completa
+  const cur = (salvo ? { ...salvo, filtro: salvo.filtro ?? null } : { ...inicial, filtro: await escolherFiltro(ent) }) as C;
+  const filtro = cur.filtro ?? null;
+  try {
+    const msg = await ler(cur);
+    await concluirLeitura(ent, filtro);
+    return prefixoFiltro(filtro) + msg;
+  } catch (e) {
+    if (!filtro || !filtroRecusado(e)) throw e;
+    const motivo = (e as Error).message;
+    const m = await lerCursor<ModoLeitura>(`modo:${ent}`);
+    await salvarCursor(`modo:${ent}`, { ultimaCompleta: m?.ultimaCompleta ?? null, desligado: true, motivo });
+    await log(ent, "entrada", "erro", `O Omie recusou o filtro por data; leitura incremental desligada (${ent}): ${motivo}`);
+    await salvarCursor(ent, null);
+    const msg = await ler({ ...inicial, filtro: null } as C);
+    await concluirLeitura(ent, null);
+    return msg;
+  }
+}
+
 // ---------- leituras ----------
+type CursorProdutos = { pagina: number; novos: number; atualizados: number; filtro?: FiltroData | null };
+
 export async function sincronizarProdutos(c: ClienteOmie, prazo: Prazo = SEM_PRAZO) {
-  const cur = (await lerCursor<{ pagina: number; novos: number; atualizados: number }>("produtos")) ?? { pagina: 1, novos: 0, atualizados: 0 };
+  return lerComModo<CursorProdutos>("produtos", { pagina: 1, novos: 0, atualizados: 0 }, (cur) => lerProdutos(c, prazo, cur));
+}
+
+async function lerProdutos(c: ClienteOmie, prazo: Prazo, cur: CursorProdutos) {
   let { novos, atualizados } = cur;
   for await (const pg of paginasDesde(
     c,
     CONTRATOS.listarProdutos,
-    (pagina) => ({ pagina, registros_por_pagina: 100, apenas_importado_api: "N", filtrar_apenas_omiepdv: "N" }),
+    (pagina) => ({ pagina, registros_por_pagina: 100, apenas_importado_api: "N", filtrar_apenas_omiepdv: "N", ...paramFiltro(cur.filtro) }),
     extrairListaProdutos,
     cur.pagina,
   )) {
@@ -168,32 +246,83 @@ export async function sincronizarProdutos(c: ClienteOmie, prazo: Prazo = SEM_PRA
     }
     if (pg.ultima) break;
     if (esgotado(prazo)) {
-      await salvarCursor("produtos", { pagina: pg.pagina + 1, novos, atualizados });
-      throw new SincronizacaoParcial(`em andamento: página ${pg.pagina} de ${pg.totalPaginas} (continua na próxima execução)`);
+      await salvarCursor("produtos", { pagina: pg.pagina + 1, novos, atualizados, filtro: cur.filtro ?? null });
+      throw new SincronizacaoParcial(`${prefixoFiltro(cur.filtro ?? null)}em andamento: página ${pg.pagina} de ${pg.totalPaginas} (continua na próxima execução)`);
     }
   }
   await salvarCursor("produtos", null);
   return `${novos} novos, ${atualizados} atualizados`;
 }
 
+// ---------- estruturas ----------
+// Uma chamada ConsultarEstrutura por item fabricado (centenas de chamadas), então
+// anda em fatias. Ordem: primeiro o que está na carteira (pedidos de venda abertos
+// e OPs ativas), descendo pela estrutura já conhecida (acabado → conjunto → peça);
+// depois o restante. Duas leituras em paralelo (o cliente limita a 2 por método).
+const STATUS_OP_ATIVOS = ["sugerida", "firmada", "liberada", "em_processo"];
+const LEITURAS_PARALELAS = 2;
+
+interface CursorEstrutura {
+  feitos: number[]; // ids dos itens já lidos neste ciclo
+  linhas: number;
+  avisos: number;
+}
+interface PaiEstrutura {
+  id: number;
+  codigo: string;
+  omie_id: number;
+  carteira: boolean;
+}
+
+/** Itens fabricados ainda não lidos no ciclo, na ordem de prioridade. */
+async function filaEstrutura(excluir: number[]): Promise<PaiEstrutura[]> {
+  const rows = await sql<{ id: number; codigo: string; omie_id: string | number; nivel: number | null }[]>`
+    with recursive raiz as (
+      select pi.item_id as id from pedido_itens pi join pedidos_venda pv on pv.id = pi.pedido_id where pv.status = 'aberto'
+      union
+      select o.item_id from ordens_producao o where o.status::text = any(${STATUS_OP_ATIVOS}::text[])
+    ), arvore(id, nivel) as (
+      select id, 0 from raiz
+      union
+      select e.filho_id, a.nivel + 1 from estrutura e join arvore a on a.id = e.pai_id where a.nivel < 20
+    ), prioridade as (
+      select id, min(nivel) as nivel from arvore group by id
+    )
+    select i.id, i.codigo, i.omie_id, p.nivel
+    from itens i left join prioridade p on p.id = i.id
+    where i.ativo and i.origem = 'fabricado' and i.omie_id is not null and not (i.id = any(${excluir}::int[]))
+    order by p.nivel is null, p.nivel, i.id`;
+  return rows.map((r) => ({ id: r.id, codigo: r.codigo, omie_id: Number(r.omie_id), carteira: r.nivel !== null }));
+}
+
 export async function sincronizarEstrutura(c: ClienteOmie, prazo: Prazo = SEM_PRAZO) {
-  // uma chamada por item fabricado: centenas de chamadas, então anda em fatias
-  const cur = (await lerCursor<{ depoisDe: number; lidas: number; linhas: number; avisos: number }>("estrutura")) ?? { depoisDe: 0, lidas: 0, linhas: 0, avisos: 0 };
-  const pais = await sql<{ id: number; codigo: string; omie_id: number }[]>`
-    select id, codigo, omie_id from itens where ativo and origem = 'fabricado' and omie_id is not null and id > ${cur.depoisDe}
-    order by id`;
-  const porOmie = new Map((await sql<{ id: number; omie_id: number }[]>`select id, omie_id from itens where omie_id is not null`).map((r) => [r.omie_id, r.id]));
+  const salvo = await lerCursor<Partial<CursorEstrutura> & { depoisDe?: number }>("estrutura");
+  // cursor antigo ({ depoisDe }) ou inválido: começa um ciclo novo
+  const cur: CursorEstrutura =
+    salvo && Array.isArray(salvo.feitos) ? { feitos: salvo.feitos, linhas: salvo.linhas ?? 0, avisos: salvo.avisos ?? 0 } : { feitos: [], linhas: 0, avisos: 0 };
+  const feitos = new Set(cur.feitos);
+  const emAndamento = new Set<number>();
+  const porOmie = new Map((await sql<{ id: number; omie_id: number }[]>`select id, omie_id from itens where omie_id is not null`).map((r) => [Number(r.omie_id), r.id]));
+  let fila = await filaEstrutura([...feitos]);
+  let foraDaCarteira = new Set(fila.filter((p) => !p.carteira).map((p) => p.id));
   let linhas = 0;
   const avisos: string[] = [];
-  let lidas = 0;
-  for (const pai of pais) {
-    if (lidas > 0 && esgotado(prazo, 3000)) {
-      await salvarCursor("estrutura", { depoisDe: pais[lidas - 1].id, lidas: cur.lidas + lidas, linhas: cur.linhas + linhas, avisos: cur.avisos + avisos.length });
-      throw new SincronizacaoParcial(`em andamento: ${cur.lidas + lidas} estruturas lidas, faltam ${pais.length - lidas} (continua na próxima execução)`);
+  let iniciadas = 0;
+  let parar = false;
+  let erro: unknown = null;
+
+  const proximo = () => {
+    while (fila.length) {
+      const p = fila.shift()!;
+      if (!feitos.has(p.id) && !emAndamento.has(p.id)) return p;
     }
-    lidas++;
+    return null;
+  };
+
+  const ler = async (pai: PaiEstrutura) => {
     const resp = await c.chamar<Record<string, unknown>>(CONTRATOS.consultarEstrutura, { idProduto: pai.omie_id }, { listagem: true });
     const est = mapearEstrutura(resp);
+    const filhos: number[] = [];
     await sql.begin(async (tx) => {
       const t = tx as unknown as Sql;
       await t`delete from estrutura where pai_id = ${pai.id} and fonte = 'omie'`;
@@ -212,12 +341,54 @@ export async function sincronizarEstrutura(c: ClienteOmie, prazo: Prazo = SEM_PR
                 on conflict (pai_id, filho_id) do update set quantidade = excluded.quantidade, perda_pct = excluded.perda_pct,
                   fonte = 'omie', updated_at = now()`;
         linhas += ls.length;
+        filhos.push(...porFilho.keys());
       }
     });
+    return filhos;
+  };
+
+  const trabalhador = async () => {
+    for (;;) {
+      if (parar || erro) return;
+      if (iniciadas > 0 && esgotado(prazo, 3000)) {
+        parar = true;
+        return;
+      }
+      const pai = proximo();
+      if (!pai) return;
+      iniciadas++;
+      emAndamento.add(pai.id);
+      try {
+        const filhos = await ler(pai);
+        feitos.add(pai.id);
+        // item da carteira revelou filhos que estavam no fim da fila: recalcula a prioridade
+        if (pai.carteira && filhos.some((f) => foraDaCarteira.has(f))) {
+          fila = await filaEstrutura([...feitos, ...emAndamento]);
+          foraDaCarteira = new Set(fila.filter((p) => !p.carteira).map((p) => p.id));
+        }
+      } catch (e) {
+        erro ??= e;
+      } finally {
+        emAndamento.delete(pai.id);
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: LEITURAS_PARALELAS }, trabalhador));
+  const progresso: CursorEstrutura = { feitos: [...feitos], linhas: cur.linhas + linhas, avisos: cur.avisos + avisos.length };
+  if (erro) {
+    // não perde o que já foi lido nesta execução
+    await salvarCursor("estrutura", progresso);
+    throw erro;
+  }
+  const faltam = fila.filter((p) => !feitos.has(p.id)).length;
+  if (faltam > 0) {
+    await salvarCursor("estrutura", progresso);
+    throw new SincronizacaoParcial(`em andamento: ${feitos.size} estruturas lidas, faltam ${faltam} (continua na próxima execução)`);
   }
   await salvarCursor("estrutura", null);
-  const totAvisos = cur.avisos + avisos.length;
-  return `${cur.lidas + lidas} estruturas lidas, ${cur.linhas + linhas} linhas${totAvisos ? `; ${totAvisos} avisos${avisos.length ? `: ${avisos.slice(0, 5).join("; ")}` : ""}` : ""}`;
+  const totAvisos = progresso.avisos;
+  return `${feitos.size} estruturas lidas, ${progresso.linhas} linhas${totAvisos ? `; ${totAvisos} avisos${avisos.length ? `: ${avisos.slice(0, 5).join("; ")}` : ""}` : ""}`;
 }
 
 export async function sincronizarEstoque(c: ClienteOmie, prazo: Prazo = SEM_PRAZO) {
@@ -262,14 +433,20 @@ export async function sincronizarEstoque(c: ClienteOmie, prazo: Prazo = SEM_PRAZ
   return `${saldos.length} saldos`;
 }
 
+type CursorPedidos = { pagina: number; n: number; filtro?: FiltroData | null };
+
 export async function sincronizarPedidos(c: ClienteOmie, prazo: Prazo = SEM_PRAZO) {
+  return lerComModo<CursorPedidos>("pedidos", { pagina: 1, n: 0 }, (cur) => lerPedidos(c, prazo, cur));
+}
+
+async function lerPedidos(c: ClienteOmie, prazo: Prazo, cur: CursorPedidos) {
   const faturado = (process.env.OMIE_ETAPAS_FATURADO ?? "60,70,80").split(",").map((s) => s.trim());
-  const cur = (await lerCursor<{ pagina: number; n: number }>("pedidos")) ?? { pagina: 1, n: 0 };
+  const nomes = (await lerCursor<Record<string, string>>("clientes:nomes")) ?? {};
   let n = cur.n;
   for await (const pg of paginasDesde(
     c,
     CONTRATOS.listarPedidosVenda,
-    (pagina) => ({ pagina, registros_por_pagina: 100, apenas_importado_api: "N" }),
+    (pagina) => ({ pagina, registros_por_pagina: 100, apenas_importado_api: "N", ...paramFiltro(cur.filtro) }),
     extrairListaPedidos,
     cur.pagina,
   )) {
@@ -277,7 +454,7 @@ export async function sincronizarPedidos(c: ClienteOmie, prazo: Prazo = SEM_PRAZ
     // o que estourava o limite de 60 s da Vercel)
     const porOmie = new Map<number, NonNullable<ReturnType<typeof mapearPedido>>>();
     for (const b of pg.registros) {
-      const p = mapearPedido(b);
+      const p = mapearPedido(b, nomes);
       if (p && p.data_entrega) porOmie.set(p.omie_id, p);
     }
     const peds = [...porOmie.values()];
@@ -328,12 +505,52 @@ export async function sincronizarPedidos(c: ClienteOmie, prazo: Prazo = SEM_PRAZ
     }
     if (pg.ultima) break;
     if (esgotado(prazo)) {
-      await salvarCursor("pedidos", { pagina: pg.pagina + 1, n });
-      throw new SincronizacaoParcial(`em andamento: página ${pg.pagina} de ${pg.totalPaginas} (continua na próxima execução)`);
+      await salvarCursor("pedidos", { pagina: pg.pagina + 1, n, filtro: cur.filtro ?? null });
+      throw new SincronizacaoParcial(`${prefixoFiltro(cur.filtro ?? null)}em andamento: página ${pg.pagina} de ${pg.totalPaginas} (continua na próxima execução)`);
     }
   }
   await salvarCursor("pedidos", null);
   return `${n} pedidos`;
+}
+
+/**
+ * Nomes dos clientes (ListarClientesResumido), 1 vez ao dia, em fatias. Guarda o
+ * mapa código → nome em integracao_estado ("cursor:clientes:nomes"), sem migração,
+ * e troca "Cliente Omie <código>" pelo nome nos pedidos já gravados.
+ */
+export async function sincronizarClientes(c: ClienteOmie, prazo: Prazo = SEM_PRAZO) {
+  const cur = (await lerCursor<{ pagina: number; nomes: Record<string, string> }>("clientes")) ?? { pagina: 1, nomes: {} };
+  const nomes: Record<string, string> = { ...cur.nomes };
+  for await (const pg of paginasDesde(
+    c,
+    CONTRATOS.listarClientesResumido,
+    (pagina) => ({ pagina, registros_por_pagina: 100, apenas_importado_api: "N" }),
+    extrairListaClientes,
+    cur.pagina,
+  )) {
+    for (const b of pg.registros) {
+      const cl = mapearClienteResumido(b);
+      if (cl) nomes[cl.codigo] = cl.nome;
+    }
+    if (pg.ultima) break;
+    if (esgotado(prazo)) {
+      await salvarCursor("clientes", { pagina: pg.pagina + 1, nomes });
+      throw new SincronizacaoParcial(`em andamento: página ${pg.pagina} de ${pg.totalPaginas} (continua na próxima execução)`);
+    }
+  }
+  const codigos = Object.keys(nomes);
+  let trocados = 0;
+  // se o Omie não devolveu nada, mantém o mapa anterior
+  if (codigos.length) {
+    await salvarCursor("clientes:nomes", nomes);
+    const r = await sql`
+      update pedidos_venda pv set cliente = x.nome, updated_at = now()
+      from unnest(${codigos}::text[], ${codigos.map((k) => nomes[k])}::text[]) as x(codigo, nome)
+      where pv.cliente = 'Cliente Omie ' || x.codigo`;
+    trocados = r.count;
+  }
+  await salvarCursor("clientes", null);
+  return `${codigos.length} clientes${trocados ? `; ${trocados} pedidos com o nome do cliente` : ""}`;
 }
 
 export async function sincronizarCompras(c: ClienteOmie) {
@@ -460,15 +677,17 @@ async function falhar(o: ItemOutbox, msg: string, definitivo: boolean) {
 
 // ---------- orquestração ----------
 const INTERVALOS_MIN: Record<string, number> = {
-  produtos: 60,
+  clientes: 24 * 60, // antes de produtos e pedidos: os pedidos já entram com o nome do cliente
+  produtos: 60, // completa 1x/dia; entre elas, só os alterados
   estoque: 10,
-  pedidos: 10,
+  pedidos: 10, // completa 1x/dia; entre elas, só os alterados
   compras: 30,
   outbox: 0,
   estrutura: 24 * 60, // por último: é a mais longa e anda em fatias
 };
 
 const TAREFAS: Record<string, (c: ClienteOmie, prazo: Prazo) => Promise<string>> = {
+  clientes: sincronizarClientes,
   produtos: sincronizarProdutos,
   estoque: sincronizarEstoque,
   pedidos: sincronizarPedidos,

@@ -106,15 +106,21 @@ export function extrairListaPedidos(r: Obj) {
   };
 }
 
-export function mapearPedido(p: Obj): PedidoOmie | null {
+/**
+ * @param nomes mapa código do cliente → nome (tarefa "clientes"). Usado quando o
+ * pedido não traz o nome do cliente; sem ele, fica "Cliente Omie <código>".
+ */
+export function mapearPedido(p: Obj, nomes?: Record<string, string>): PedidoOmie | null {
   const cab = campo<Obj>(p, "cabecalho") ?? {};
   const omie_id = num(campo(cab, "codigo_pedido"));
   if (!omie_id) return null;
   const det = (campo<Obj[]>(p, "det") ?? []) as Obj[];
+  const codCliente = campo(cab, "codigo_cliente");
+  const nomeDoMapa = codCliente !== undefined ? nomes?.[String(codCliente)] : undefined;
   return {
     omie_id,
     numero: String(campo(cab, "numero_pedido") ?? omie_id),
-    cliente: String(campo(p, "informacoes_adicionais.nome_cliente", "cabecalho.nome_cliente") ?? `Cliente Omie ${campo(cab, "codigo_cliente") ?? "?"}`),
+    cliente: String(campo(p, "informacoes_adicionais.nome_cliente", "cabecalho.nome_cliente") ?? nomeDoMapa ?? `Cliente Omie ${codCliente ?? "?"}`),
     data_emissao: deOmie(campo(p, "infoCadastro.dInc", "cabecalho.data_emissao") as string),
     data_entrega: deOmie(campo(cab, "data_previsao") as string),
     etapa: String(campo(cab, "etapa") ?? ""),
@@ -123,6 +129,25 @@ export function mapearPedido(p: Obj): PedidoOmie | null {
       .map((d) => ({ produto_omie_id: num(campo(d, "produto.codigo_produto")), quantidade: num(campo(d, "produto.quantidade")) }))
       .filter((i) => i.produto_omie_id && i.quantidade > 0),
   };
+}
+
+export interface ClienteResumidoOmie {
+  codigo: string;
+  nome: string;
+}
+
+export function extrairListaClientes(r: Obj) {
+  return {
+    registros: (campo<Obj[]>(r, "clientes_cadastro_resumido") ?? []) as Obj[],
+    totalPaginas: num(campo(r, "total_de_paginas")),
+  };
+}
+
+export function mapearClienteResumido(c: Obj): ClienteResumidoOmie | null {
+  const codigo = campo(c, "codigo_cliente");
+  const nome = String(campo(c, "nome_fantasia", "razao_social") ?? "").trim();
+  if (codigo === undefined || !nome) return null;
+  return { codigo: String(codigo), nome };
 }
 
 export interface RecebimentoOmie {
